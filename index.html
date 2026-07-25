@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Traceline — Find contact details for any company list</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<div class="grain"></div>
+
+<header class="topbar">
+  <div class="wrap topbar-inner">
+    <div class="brand">
+      <span class="brand-mark">—◆—</span>
+      <span class="brand-name">TRACELINE</span>
+    </div>
+    <div class="topbar-tag">contact discovery, run from a list</div>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div class="wrap hero-inner">
+      <div class="hero-copy">
+        <p class="eyebrow">Company list in — verified contact ledger out</p>
+        <h1>Give it 500 companies.<br>It comes back with who to call.</h1>
+        <p class="hero-sub">Paste a list of company names and websites. Traceline visits each
+          site, reads the pages a human would check — homepage, contact, about —
+          and logs the email, phone number, and Instagram it finds. No manual digging,
+          no copy-pasting between forty browser tabs.</p>
+        <a href="#run" class="btn btn-primary">Start a run ↓</a>
+      </div>
+      <div class="hero-ledger" aria-hidden="true">
+        <div class="ledger-card">
+          <div class="ledger-card-head">
+            <span>Sample entries</span>
+            <span class="ledger-card-head-dot"></span>
+          </div>
+          <div class="ledger-row">
+            <span class="lr-name">Marigold Dental</span>
+            <span class="lr-dots"></span>
+            <span class="lr-stamp stamp-found">FOUND</span>
+          </div>
+          <div class="ledger-row-detail">hello@marigolddental.com · (03) 8891 2244 · @marigolddental</div>
+          <div class="ledger-row">
+            <span class="lr-name">Harbor & Vine Co.</span>
+            <span class="lr-dots"></span>
+            <span class="lr-stamp stamp-found">FOUND</span>
+          </div>
+          <div class="ledger-row-detail">contact@harborvine.co · @harborandvine</div>
+          <div class="ledger-row">
+            <span class="lr-name">Nolan Freight Ltd</span>
+            <span class="lr-dots"></span>
+            <span class="lr-stamp stamp-empty">NO DATA</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="run" id="run">
+    <div class="wrap">
+      <div class="section-head">
+        <span class="section-num">01</span>
+        <h2>Load your list</h2>
+      </div>
+
+      <div class="input-panel">
+        <div class="tabs">
+          <button class="tab-btn active" data-tab="paste">Paste list</button>
+          <button class="tab-btn" data-tab="upload">Upload CSV</button>
+        </div>
+
+        <div class="tab-panel active" data-panel="paste">
+          <p class="hint">One company per line — <code>Company Name, https://website.com</code></p>
+          <textarea id="pasteArea" rows="9" placeholder="Marigold Dental, https://marigolddental.com
+Harbor &amp; Vine Co., https://harborvine.co
+Nolan Freight Ltd, https://nolanfreight.com"></textarea>
+        </div>
+
+        <div class="tab-panel" data-panel="upload">
+          <p class="hint">CSV with two columns: company name, website. Header row optional.</p>
+          <label class="file-drop" id="fileDrop">
+            <input type="file" id="fileInput" accept=".csv" hidden>
+            <span id="fileLabel">Choose a .csv file, or drag it here</span>
+          </label>
+        </div>
+
+        <div class="run-bar">
+          <span class="run-limit">Up to {{ max_companies }} companies per run</span>
+          <button class="btn btn-primary" id="runBtn">Run Traceline</button>
+        </div>
+        <p class="error-msg" id="errorMsg"></p>
+      </div>
+    </div>
+  </section>
+
+  <section class="results" id="resultsSection" hidden>
+    <div class="wrap">
+      <div class="section-head">
+        <span class="section-num">02</span>
+        <h2>Ledger</h2>
+      </div>
+
+      <div class="progress-block">
+        <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+        <div class="progress-label" id="progressLabel">Starting…</div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="ledger-table">
+          <thead>
+            <tr>
+              <th>Company</th>
+              <th>Website</th>
+              <th>Email</th>
+              <th>Phone</th>
+              <th>Instagram</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="resultsBody"></tbody>
+        </table>
+      </div>
+
+      <div class="download-bar" id="downloadBar" hidden>
+        <p>Run complete.</p>
+        <a class="btn btn-primary" id="downloadBtn" href="#">Download CSV ↓</a>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <div class="wrap">Traceline — run locally, your data never leaves your own server.</div>
+</footer>
+
+<script src="/static/script.js"></script>
+</body>
+</html>
