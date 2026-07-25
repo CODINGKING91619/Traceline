@@ -32,22 +32,70 @@ JOBS_LOCK = threading.Lock()
 MAX_COMPANIES = 500
 
 
+PHONE_LINE_RE = re.compile(r"^\+?[\d\s\-().]{7,}$")
+URL_HINT_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
+
+
 def parse_input_text(raw_text):
-    """Accepts pasted lines like 'Company Name, https://site.com' (comma
-    or tab separated). Skips a header row if one is detected."""
+    """Handles two paste formats:
+    1) One line per company: 'Company Name, https://site.com' (comma or tab separated)
+    2) Multi-line blocks separated by blank lines, e.g.:
+         Company Name
+             1 303-718-2001
+             https://site.com
+       (common when pasting straight out of a spreadsheet or directory export)
+    Returns a list of dicts: {"name": ..., "website": ..., "phone": ... or None}
+    """
+    lines = raw_text.splitlines()
     companies = []
-    for line in raw_text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = re.split(r"\t|,", line, maxsplit=1)
-        if len(parts) != 2:
-            continue
-        name, site = parts[0].strip(), parts[1].strip()
-        if name.lower() in ("company_name", "company", "name") and "http" not in site.lower():
-            continue  # header row
-        if name and site:
-            companies.append((name, site))
+
+    def flush(block):
+        name, website, phone = None, None, None
+        for raw_line in block:
+            line = raw_line.strip()
+            if not line:
+                continue
+            if URL_HINT_RE.search(line) and website is None:
+                website = line
+            elif PHONE_LINE_RE.match(line) and phone is None:
+                phone = line
+            elif name is None:
+                name = line
+        if name and website:
+            return {"name": name, "website": website, "phone": phone}
+        return None
+
+    block = []
+    for line in lines:
+        if line.strip() == "":
+            continue  # ignore truly blank lines
+        leading_ws = len(line) - len(line.lstrip(" \t"))
+        if leading_ws == 0:
+            # a line with no indentation starts a new company record
+            result = flush(block)
+            if result:
+                companies.append(result)
+            block = [line]
+        else:
+            block.append(line)
+    result = flush(block)
+    if result:
+        companies.append(result)
+
+    # Fallback: simple one-line "Name, Website" paste (only if block parsing found nothing)
+    if not companies:
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            parts = re.split(r"\t|,", line, maxsplit=1)
+            if len(parts) == 2:
+                name, site = parts[0].strip(), parts[1].strip()
+                if name.lower() in ("company_name", "company", "name") and "http" not in site.lower():
+                    continue
+                if name and site and URL_HINT_RE.search(site):
+                    companies.append({"name": name, "website": site, "phone": None})
+
     return companies
 
 
@@ -66,20 +114,25 @@ def parse_input_csv(file_storage):
         if len(row) < 2:
             continue
         name, site = row[0].strip(), row[1].strip()
+        phone = row[2].strip() if len(row) > 2 and row[2].strip() else None
         if name and site:
-            companies.append((name, site))
+            companies.append({"name": name, "website": site, "phone": phone})
     return companies
 
 
 def run_job(job_id, companies):
     job = JOBS[job_id]
-    for name, site in companies:
+    for company in companies:
+        name, site, given_phone = company["name"], company["website"], company.get("phone")
         try:
             emails, phones, instagram = extract_contacts(site)
+            if not phones and given_phone:
+                phones = [given_phone]
             status = "found" if (emails or phones or instagram) else "no data"
-        except Exception as e:
-            emails, phones, instagram = [], [], None
-            status = f"error"
+        except Exception:
+            emails, instagram = [], None
+            phones = [given_phone] if given_phone else []
+            status = "error"
 
         with JOBS_LOCK:
             job["rows"].append({
@@ -165,4 +218,6 @@ def download(job_id):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    import os
+    port = int(os.environ.get("PORT", 5000))
+    app.run(debug=False, host="0.0.0.0", port=port)
