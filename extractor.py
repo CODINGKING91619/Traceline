@@ -146,42 +146,80 @@ def clean_phone(raw):
     return raw.strip()
 
 
+def decode_cf_email(cf_hex):
+    try:
+        key = int(cf_hex[:2], 16)
+        email_bytes = [int(cf_hex[i:i+2], 16) ^ key for i in range(2, len(cf_hex), 2)]
+        decoded = "".join(chr(b) for b in email_bytes)
+        if EMAIL_REGEX.fullmatch(decoded) and not decoded.lower().endswith(IMAGE_EXT):
+            return decoded.lower()
+    except Exception:
+        pass
+    return None
+
+
 def _scan_soup(soup, raw_html="", base_url="", fetched_scripts=None):
     """Pulls emails/phones/instagram out of one already-fetched page."""
     emails, phones = set(), set()
     instagram = None
-    if not soup:
+    if not soup and not raw_html:
         return emails, phones, instagram
 
     if fetched_scripts is None:
         fetched_scripts = set()
 
-    # 1. Standard spaced text extraction for clean reading of body text
-    spaced_text = soup.get_text(" ")
-    for e in EMAIL_REGEX.findall(spaced_text):
-        if not e.lower().endswith(IMAGE_EXT):
-            emails.add(e.lower())
-    for p in PHONE_REGEX.findall(spaced_text):
-        cp = clean_phone(p)
-        if cp:
-            phones.add(cp)
+    # 1. Cloudflare Email Obfuscation Decoding (data-cfemail & /cdn-cgi/l/email-protection#...)
+    if soup:
+        for tag in soup.find_all(attrs={"data-cfemail": True}):
+            dec = decode_cf_email(tag["data-cfemail"])
+            if dec:
+                emails.add(dec)
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "email-protection" in href:
+                cf_hex = href.split("#")[-1]
+                dec = decode_cf_email(cf_hex)
+                if dec:
+                    emails.add(dec)
 
-    # 2. Check all individual HTML tags for letter-split animated emails (e.g. <span>H</span><span>E</span>...)
-    for el in soup.find_all(True):
-        if el.name in ("script", "style", "svg", "path", "img", "meta", "link"):
-            continue
-        el_text = el.get_text("")
-        if "@" in el_text:
-            for e in EMAIL_REGEX.findall(el_text):
-                if not e.lower().endswith(IMAGE_EXT):
-                    emails.add(e.lower())
+    html_source = raw_html or (str(soup) if soup else "")
+    if html_source:
+        for match in re.findall(r'data-cfemail=["\']([a-fA-F0-9]+)["\']', html_source):
+            dec = decode_cf_email(match)
+            if dec:
+                emails.add(dec)
+        for match in re.findall(r'/email-protection#([a-fA-F0-9]+)', html_source):
+            dec = decode_cf_email(match)
+            if dec:
+                emails.add(dec)
 
-    # 3. Raw HTML string & JSON-LD schema scanning
-    html_source = raw_html or str(soup)
-    for e in EMAIL_REGEX.findall(html_source):
-        el = e.lower()
-        if not el.endswith(IMAGE_EXT) and not any(ign in el for ign in ["w3.org", "schema.org", "example.com", "yourcompany.com"]):
-            emails.add(el)
+    # 2. Standard spaced text extraction for clean reading of body text
+    if soup:
+        spaced_text = soup.get_text(" ")
+        for e in EMAIL_REGEX.findall(spaced_text):
+            if not e.lower().endswith(IMAGE_EXT):
+                emails.add(e.lower())
+        for p in PHONE_REGEX.findall(spaced_text):
+            cp = clean_phone(p)
+            if cp:
+                phones.add(cp)
+
+        # 3. Check all individual HTML tags for letter-split animated emails (e.g. <span>H</span><span>E</span>...)
+        for el in soup.find_all(True):
+            if el.name in ("script", "style", "svg", "path", "img", "meta", "link"):
+                continue
+            el_text = el.get_text("")
+            if "@" in el_text:
+                for e in EMAIL_REGEX.findall(el_text):
+                    if not e.lower().endswith(IMAGE_EXT):
+                        emails.add(e.lower())
+
+    # 4. Raw HTML string & JSON-LD schema scanning
+    if html_source:
+        for e in EMAIL_REGEX.findall(html_source):
+            el = e.lower()
+            if not el.endswith(IMAGE_EXT) and not any(ign in el for ign in ["w3.org", "schema.org", "example.com", "yourcompany.com"]):
+                emails.add(el)
 
     # 4. External JS Bundle Scanning (catches phone/email stored in JS assets like index-DPpQS5OG.js)
     if base_url:
