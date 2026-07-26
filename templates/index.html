@@ -103,33 +103,21 @@ Nolan Freight Ltd, https://nolanfreight.com"></textarea>
     <div class="wrap">
       <div class="section-head">
         <span class="section-num">02</span>
-        <h2>Ledger</h2>
+        <h2>Running</h2>
       </div>
 
-      <div class="progress-block">
+      <div class="scan-block">
         <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
-        <div class="progress-label" id="progressLabel">Starting…</div>
+
+        <div class="scan-status" id="scanStatus">
+          <span class="scan-dot"></span>
+          <span id="scanText">Starting…</span>
+        </div>
       </div>
 
-      <div class="table-wrap">
-        <table class="ledger-table">
-          <thead>
-            <tr>
-              <th>Company</th>
-              <th>Website</th>
-              <th>Email</th>
-              <th>Phone</th>
-              <th>Instagram</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody id="resultsBody"></tbody>
-        </table>
-      </div>
-
-      <div class="download-bar" id="downloadBar" hidden>
-        <p>Run complete.</p>
-        <a class="btn btn-primary" id="downloadBtn" href="#">Download CSV ↓</a>
+      <div class="download-bar" id="downloadBar">
+        <p id="doneMsg">Download unlocks once every company has been checked.</p>
+        <a class="btn btn-primary btn-disabled" id="downloadBtn" href="#" tabindex="-1">Download CSV ↓</a>
       </div>
     </div>
   </section>
