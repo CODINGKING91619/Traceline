@@ -28,7 +28,7 @@ app = Flask(__name__)
 JOBS = {}  # job_id -> dict(status, total, done, rows, current)
 JOBS_LOCK = threading.Lock()
 
-MAX_COMPANIES = 500
+MAX_COMPANIES = 300
 
 
 def instagram_username(url):
