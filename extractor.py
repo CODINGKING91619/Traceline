@@ -61,22 +61,36 @@ def extract_contacts(base_url):
             time.sleep(DELAY_BETWEEN_PAGES)
             continue
 
+        # 1) visible page text — catches emails/phones written out as plain text
         text = soup.get_text(" ")
         for e in EMAIL_REGEX.findall(text):
             if not e.lower().endswith(IMAGE_EXT):
                 emails.add(e.lower())
-
         for p in PHONE_REGEX.findall(text):
             cp = clean_phone(p)
             if cp:
                 phones.add(cp)
 
-        if not instagram:
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if "instagram.com" in href and "/p/" not in href:
+        # 2) link hrefs — catches contact info hidden behind "Email Us" / "Call Us"
+        #    style buttons where the address only exists inside the href, not the
+        #    visible text
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+
+            if href.lower().startswith("mailto:"):
+                addr = href[7:].split("?")[0].strip()
+                if EMAIL_REGEX.fullmatch(addr) and not addr.lower().endswith(IMAGE_EXT):
+                    emails.add(addr.lower())
+
+            elif href.lower().startswith("tel:"):
+                raw = href[4:].strip()
+                cp = clean_phone(raw)
+                if cp:
+                    phones.add(cp)
+
+            elif not instagram and ("instagram.com" in href or "instagr.am" in href):
+                if "/p/" not in href and "/reel/" not in href:
                     instagram = href.split("?")[0]
-                    break
 
         time.sleep(DELAY_BETWEEN_PAGES)
 

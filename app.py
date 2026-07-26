@@ -16,9 +16,8 @@ import csv
 import io
 import re
 import threading
-import time
 import uuid
-from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import Flask, request, jsonify, render_template, send_file, abort
 
@@ -26,10 +25,21 @@ from extractor import extract_contacts
 
 app = Flask(__name__)
 
-JOBS = {}  # job_id -> dict(status, total, done, rows, error)
+JOBS = {}  # job_id -> dict(status, total, done, rows, current)
 JOBS_LOCK = threading.Lock()
 
 MAX_COMPANIES = 500
+
+
+def instagram_username(url):
+    """Turns a full Instagram URL into just '@username'."""
+    if not url:
+        return None
+    path = urlparse(url).path.strip("/")
+    username = path.split("/")[0] if path else None
+    if not username:
+        return None
+    return "@" + username
 
 
 PHONE_LINE_RE = re.compile(r"^\+?[\d\s\-().]{7,}$")
@@ -124,13 +134,18 @@ def run_job(job_id, companies):
     job = JOBS[job_id]
     for company in companies:
         name, site, given_phone = company["name"], company["website"], company.get("phone")
+
+        with JOBS_LOCK:
+            job["current"] = name
+
         try:
             emails, phones, instagram = extract_contacts(site)
             if not phones and given_phone:
                 phones = [given_phone]
-            status = "found" if (emails or phones or instagram) else "no data"
+            ig_username = instagram_username(instagram)
+            status = "found" if (emails or phones or ig_username) else "no data"
         except Exception:
-            emails, instagram = [], None
+            emails, ig_username = [], None
             phones = [given_phone] if given_phone else []
             status = "error"
 
@@ -140,12 +155,13 @@ def run_job(job_id, companies):
                 "website": site,
                 "emails": ", ".join(emails),
                 "phones": ", ".join(phones),
-                "instagram": instagram or "",
+                "instagram": ig_username or "",
                 "status": status,
             })
             job["done"] += 1
 
     with JOBS_LOCK:
+        job["current"] = None
         job["status"] = "complete"
 
 
@@ -172,7 +188,10 @@ def start_job():
 
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
-        JOBS[job_id] = {"status": "running", "total": len(companies), "done": 0, "rows": []}
+        JOBS[job_id] = {
+            "status": "running", "total": len(companies), "done": 0,
+            "rows": [], "current": None,
+        }
 
     thread = threading.Thread(target=run_job, args=(job_id, companies), daemon=True)
     thread.start()
@@ -190,7 +209,7 @@ def job_status(job_id):
             "status": job["status"],
             "total": job["total"],
             "done": job["done"],
-            "rows": job["rows"][-50:],  # latest rows for live preview
+            "current": job.get("current"),
         })
 
 
