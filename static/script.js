@@ -30,34 +30,13 @@ document.addEventListener("DOMContentLoaded", () => {
   const errorMsg = document.getElementById("errorMsg");
   const resultsSection = document.getElementById("resultsSection");
   const progressFill = document.getElementById("progressFill");
-  const progressLabel = document.getElementById("progressLabel");
-  const resultsBody = document.getElementById("resultsBody");
+  const scanText = document.getElementById("scanText");
+  const scanStatus = document.getElementById("scanStatus");
   const downloadBar = document.getElementById("downloadBar");
   const downloadBtn = document.getElementById("downloadBtn");
+  const doneMsg = document.getElementById("doneMsg");
 
   let pollTimer = null;
-
-  function statusClass(status) {
-    if (status === "found") return "status-found";
-    if (status === "error") return "status-error";
-    return "status-nodata";
-  }
-
-  function renderRows(rows) {
-    resultsBody.innerHTML = "";
-    rows.forEach(r => {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
-        <td>${escapeHtml(r.company)}</td>
-        <td>${escapeHtml(r.website)}</td>
-        <td>${escapeHtml(r.emails) || "—"}</td>
-        <td>${escapeHtml(r.phones) || "—"}</td>
-        <td>${escapeHtml(r.instagram) || "—"}</td>
-        <td class="${statusClass(r.status)}">${r.status}</td>
-      `;
-      resultsBody.appendChild(tr);
-    });
-  }
 
   function escapeHtml(str) {
     if (!str) return "";
@@ -73,18 +52,21 @@ document.addEventListener("DOMContentLoaded", () => {
       const data = await res.json();
       const pct = data.total ? Math.round((data.done / data.total) * 100) : 0;
       progressFill.style.width = pct + "%";
-      progressLabel.textContent = `${data.done} / ${data.total} processed`;
-      renderRows(data.rows);
 
       if (data.status === "complete") {
         clearInterval(pollTimer);
-        progressLabel.textContent = `Done — ${data.total} / ${data.total} processed`;
-        downloadBar.hidden = false;
-        downloadBtn.href = `/api/download/${jobId}`;
+        scanStatus.hidden = true;
         runBtn.disabled = false;
         runBtn.textContent = "Run Traceline";
+
+        doneMsg.textContent = `Done — ${data.total} companies processed.`;
+        downloadBtn.href = `/api/download/${jobId}`;
+        downloadBtn.classList.remove("btn-disabled");
+        downloadBtn.removeAttribute("tabindex");
+      } else if (data.current) {
+        scanText.innerHTML = `Checking <span class="company-name">${escapeHtml(data.current)}</span>…`;
       }
-    }, 1200);
+    }, 900);
   }
 
   runBtn.addEventListener("click", async () => {
@@ -109,9 +91,13 @@ document.addEventListener("DOMContentLoaded", () => {
 
     runBtn.disabled = true;
     runBtn.textContent = "Starting…";
-    downloadBar.hidden = true;
-    resultsBody.innerHTML = "";
+    scanStatus.hidden = false;
+    scanText.textContent = "Starting…";
     progressFill.style.width = "0%";
+    doneMsg.textContent = "Download unlocks once every company has been checked.";
+    downloadBtn.textContent = "Download CSV ↓";
+    downloadBtn.classList.add("btn-disabled");
+    downloadBtn.setAttribute("tabindex", "-1");
 
     try {
       const res = await fetch("/api/start", { method: "POST", body: formData });
@@ -125,7 +111,6 @@ document.addEventListener("DOMContentLoaded", () => {
       resultsSection.hidden = false;
       resultsSection.scrollIntoView({ behavior: "smooth" });
       runBtn.textContent = "Running…";
-      progressLabel.textContent = `0 / ${data.total} processed`;
       poll(data.job_id);
     } catch (err) {
       errorMsg.textContent = "Could not reach the server.";
