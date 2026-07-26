@@ -17,9 +17,9 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-SUBPAGES_TO_CHECK = ["", "/contact", "/contact-us", "/about", "/about-us"]
+DEFAULT_SUBPAGES = ["", "/contact", "/contact-us", "/contacts", "/about", "/about-us", "/get-in-touch"]
 REQUEST_TIMEOUT = 10
-DELAY_BETWEEN_PAGES = 0.6
+DELAY_BETWEEN_PAGES = 0.5
 RENDER_TIMEOUT_MS = 15000
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
@@ -30,18 +30,28 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
-    )
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
 # ---------------- fast path: plain HTTP fetch ----------------
 
 def get_soup(url):
-    try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers=HEADERS)
-        if resp.status_code == 200 and "text/html" in resp.headers.get("Content-Type", ""):
-            return BeautifulSoup(resp.text, "html.parser")
-    except requests.RequestException:
-        return None
+    """Fetches a URL using requests with fallback to http:// if https:// fails."""
+    urls_to_try = [url]
+    if url.startswith("https://"):
+        urls_to_try.append(url.replace("https://", "http://"))
+
+    for u in urls_to_try:
+        try:
+            resp = requests.get(u, timeout=REQUEST_TIMEOUT, headers=HEADERS, allow_redirects=True)
+            if resp.status_code == 200:
+                ct = resp.headers.get("Content-Type", "").lower()
+                if not ct or "text/html" in ct or "xhtml" in ct:
+                    return BeautifulSoup(resp.text, "html.parser")
+        except requests.RequestException:
+            continue
     return None
 
 
@@ -54,8 +64,7 @@ _browser_lock = threading.Lock()
 
 def _get_browser():
     """Launches one shared headless Chromium instance, reused for the life
-    of the server process (launching a fresh browser per page would be far
-    too slow)."""
+    of the server process."""
     global _playwright, _browser
     with _browser_lock:
         if _browser is None:
@@ -63,52 +72,52 @@ def _get_browser():
             _playwright = sync_playwright().start()
             _browser = _playwright.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-blink-features=AutomationControlled",
+                ],
             )
         return _browser
 
 
 def get_soup_rendered(url):
-    """Loads the page in a real (headless) browser, waits for it to load
-    and gives any late JavaScript a moment to finish, then returns the
-    fully-rendered HTML. Used only as a fallback when the fast fetch finds
-    nothing, since this is much slower.
-
-    Deliberately does NOT wait for full "network idle" — sites with a live
-    chat widget or analytics script that keeps polling in the background
-    would never go idle and we'd time out and lose everything. Waiting for
-    the page's load event, then a short fixed pause for JS to settle, is
-    more forgiving and still catches JS-injected content.
-    """
+    """Loads page in Playwright using custom context (User-Agent + Viewport)
+    to bypass headless bot blocks and render JS-injected elements."""
     try:
         browser = _get_browser()
-        page = browser.new_page()
+        context = browser.new_context(
+            user_agent=HEADERS["User-Agent"],
+            viewport={"width": 1280, "height": 800},
+            device_scale_factor=1,
+        )
+        page = context.new_page()
         try:
             page.set_default_timeout(RENDER_TIMEOUT_MS)
             try:
                 page.goto(url, wait_until="load", timeout=RENDER_TIMEOUT_MS)
             except Exception:
-                pass  # even a slow/incomplete load may have usable content by now
+                pass  # grab whatever HTML rendered before timeout
             page.wait_for_timeout(1500)
             html = page.content()
             return BeautifulSoup(html, "html.parser")
         finally:
             page.close()
+            context.close()
     except Exception:
         return None
 
 
 # ---------------- shared parsing of a page's contact info ----------------
 
-FAKE_PHONE_RE = re.compile(r"555.?01\d{2}")
-
-
 def clean_phone(raw):
     digits = re.sub(r"\D", "", raw)
     if len(digits) < 7:
         return None
-    if FAKE_PHONE_RE.search(raw):
-        return None  # 555-01xx is the reserved placeholder/fictional range
+    # 555-01xx (5550100 through 5550199) is the reserved placeholder/fictional range in North America
+    if re.search(r"55501\d{2}", digits):
+        return None
     return raw.strip()
 
 
@@ -119,19 +128,27 @@ def _scan_soup(soup):
     if not soup:
         return emails, phones, instagram
 
-    # visible page text, checked two ways:
-    # - with spaces between elements (correct for normal flowing sentences)
-    # - with no spaces (catches "letter-split" animated headings some sites
-    #   use, e.g. HELLO@COMPANY.COM rendered as one <span> per character,
-    #   which the space-separated version would otherwise break apart)
-    for text in (soup.get_text(" "), soup.get_text("")):
-        for e in EMAIL_REGEX.findall(text):
-            if not e.lower().endswith(IMAGE_EXT):
-                emails.add(e.lower())
-        for p in PHONE_REGEX.findall(text):
-            cp = clean_phone(p)
-            if cp:
-                phones.add(cp)
+    # 1. Standard spaced text extraction for clean reading of body text
+    spaced_text = soup.get_text(" ")
+    for e in EMAIL_REGEX.findall(spaced_text):
+        if not e.lower().endswith(IMAGE_EXT):
+            emails.add(e.lower())
+    for p in PHONE_REGEX.findall(spaced_text):
+        cp = clean_phone(p)
+        if cp:
+            phones.add(cp)
+
+    # 2. Check all individual HTML tags for letter-split animated emails (e.g. <span>H</span><span>E</span>...)
+    # Checking element-by-element prevents concatenating unrelated text across the page.
+    for el in soup.find_all(True):
+        if el.name in ("script", "style", "svg", "path", "img", "meta", "link"):
+            continue
+        el_text = el.get_text("")
+        # Only inspect tags with '@' and reasonable content length to avoid giant parent wrappers
+        if "@" in el_text and len(el_text) < 1000:
+            for e in EMAIL_REGEX.findall(el_text):
+                if not e.lower().endswith(IMAGE_EXT):
+                    emails.add(e.lower())
 
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
@@ -154,28 +171,72 @@ def _scan_soup(soup):
     return emails, phones, instagram
 
 
+def find_contact_links(soup, base_url):
+    """Discovers candidate contact page URLs from <a> tags on the page."""
+    links = []
+    if not soup:
+        return links
+    parsed_base = urlparse(base_url)
+    base_netloc = parsed_base.netloc.lower()
+
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        text = a.get_text(" ").lower()
+        full_url = urljoin(base_url, href)
+        parsed_url = urlparse(full_url)
+
+        # Only stay on same domain
+        if parsed_url.netloc.lower() != base_netloc:
+            continue
+
+        path_lower = parsed_url.path.lower()
+        if any(kw in path_lower or kw in text for kw in ["contact", "about", "reach", "touch", "connect"]):
+            if full_url not in links and parsed_url.path not in ["", "/"]:
+                links.append(full_url)
+    return links[:5]  # limit to top 5 discovered links
+
+
 def extract_contacts(base_url):
     """Returns (emails: list[str], phones: list[str], instagram: str|None)"""
     emails, phones = set(), set()
     instagram = None
 
+    if not base_url:
+        return [], [], None
+
+    base_url = base_url.strip().strip('"').strip("'")
     if not base_url.startswith(("http://", "https://")):
         base_url = "https://" + base_url
 
     parsed = urlparse(base_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
 
-    for path in SUBPAGES_TO_CHECK:
-        url = urljoin(base, path)
+    subpages = list(DEFAULT_SUBPAGES)
+    checked_urls = set()
+
+    for idx, path in enumerate(subpages):
+        url = urljoin(base, path) if isinstance(path, str) and path.startswith("/") or path == "" else path
+        if url in checked_urls:
+            continue
+        checked_urls.add(url)
 
         soup = get_soup(url)
+
+        # On homepage, discover any specific contact/about subpage links dynamically
+        if idx == 0 and soup:
+            discovered = find_contact_links(soup, base)
+            for link in discovered:
+                if link not in checked_urls and link not in subpages:
+                    subpages.append(link)
+
         e1, p1, ig1 = _scan_soup(soup)
         emails |= e1
         phones |= p1
         if not instagram and ig1:
             instagram = ig1
 
-        if not (e1 or p1 or ig1):
+        # If no email found on fast path, try headless browser to render JS content
+        if not e1:
             soup_r = get_soup_rendered(url)
             e2, p2, ig2 = _scan_soup(soup_r)
             emails |= e2
@@ -186,3 +247,5 @@ def extract_contacts(base_url):
         time.sleep(DELAY_BETWEEN_PAGES)
 
     return list(emails), list(phones), instagram
+
+
