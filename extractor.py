@@ -17,7 +17,10 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-DEFAULT_SUBPAGES = ["", "/contact", "/contact-us", "/contacts", "/about", "/about-us", "/get-in-touch"]
+DEFAULT_SUBPAGES = [
+    "", "/contact", "/contact-us", "/contacts", "/get-started", "/start",
+    "/book-a-call", "/about", "/about-us", "/get-in-touch"
+]
 REQUEST_TIMEOUT = 10
 DELAY_BETWEEN_PAGES = 0.5
 RENDER_TIMEOUT_MS = 15000
@@ -38,7 +41,8 @@ HEADERS = {
 # ---------------- fast path: plain HTTP fetch ----------------
 
 def get_soup(url):
-    """Fetches a URL using requests with fallback to http:// if https:// fails."""
+    """Fetches a URL using requests with fallback to http:// if https:// fails.
+    Returns (soup, raw_html)."""
     urls_to_try = [url]
     if url.startswith("https://"):
         urls_to_try.append(url.replace("https://", "http://"))
@@ -49,10 +53,10 @@ def get_soup(url):
             if resp.status_code == 200:
                 ct = resp.headers.get("Content-Type", "").lower()
                 if not ct or "text/html" in ct or "xhtml" in ct:
-                    return BeautifulSoup(resp.text, "html.parser")
+                    return BeautifulSoup(resp.text, "html.parser"), resp.text
         except requests.RequestException:
             continue
-    return None
+    return None, ""
 
 
 # ---------------- slow path: headless browser (JS-rendered) ----------------
@@ -84,12 +88,13 @@ def _get_browser():
 
 def get_soup_rendered(url):
     """Loads page in Playwright using custom context (User-Agent + Viewport)
-    to bypass headless bot blocks and render JS-injected elements."""
+    to bypass headless bot blocks and render JS-injected elements.
+    Scrolls to the bottom to trigger lazy-loaded footers and return full HTML."""
     try:
         browser = _get_browser()
         context = browser.new_context(
             user_agent=HEADERS["User-Agent"],
-            viewport={"width": 1280, "height": 800},
+            viewport={"width": 1280, "height": 900},
             device_scale_factor=1,
         )
         page = context.new_page()
@@ -99,14 +104,22 @@ def get_soup_rendered(url):
                 page.goto(url, wait_until="load", timeout=RENDER_TIMEOUT_MS)
             except Exception:
                 pass  # grab whatever HTML rendered before timeout
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(1000)
+
+            # Scroll to bottom of page to trigger lazy-loaded footers & social links
+            try:
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(1000)
+            except Exception:
+                pass
+
             html = page.content()
-            return BeautifulSoup(html, "html.parser")
+            return BeautifulSoup(html, "html.parser"), html
         finally:
             page.close()
             context.close()
     except Exception:
-        return None
+        return None, ""
 
 
 # ---------------- shared parsing of a page's contact info ----------------
@@ -118,10 +131,15 @@ def clean_phone(raw):
     # 555-01xx (5550100 through 5550199) is the reserved placeholder/fictional range in North America
     if re.search(r"55501\d{2}", digits):
         return None
+    # Normalize phone formatting so duplicate variations (e.g. 8552652252, 855.265.2252, 855-265-2252) collapse into one entry
+    if len(digits) == 10:
+        return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
+    elif len(digits) == 11 and digits.startswith("1"):
+        return f"+1 {digits[1:4]}-{digits[4:7]}-{digits[7:]}"
     return raw.strip()
 
 
-def _scan_soup(soup):
+def _scan_soup(soup, raw_html=""):
     """Pulls emails/phones/instagram out of one already-fetched page."""
     emails, phones = set(), set()
     instagram = None
@@ -139,16 +157,21 @@ def _scan_soup(soup):
             phones.add(cp)
 
     # 2. Check all individual HTML tags for letter-split animated emails (e.g. <span>H</span><span>E</span>...)
-    # Checking element-by-element prevents concatenating unrelated text across the page.
     for el in soup.find_all(True):
         if el.name in ("script", "style", "svg", "path", "img", "meta", "link"):
             continue
         el_text = el.get_text("")
-        # Only inspect tags with '@' and reasonable content length to avoid giant parent wrappers
         if "@" in el_text and len(el_text) < 1000:
             for e in EMAIL_REGEX.findall(el_text):
                 if not e.lower().endswith(IMAGE_EXT):
                     emails.add(e.lower())
+
+    # 3. Raw HTML string & JSON-LD schema scanning (catches "email": "customerservice@socialeramedia.com")
+    html_source = raw_html or str(soup)
+    for e in EMAIL_REGEX.findall(html_source):
+        el = e.lower()
+        if not el.endswith(IMAGE_EXT) and not any(ign in el for ign in ["w3.org", "schema.org", "domain.com", "example.com"]):
+            emails.add(el)
 
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
@@ -190,7 +213,7 @@ def find_contact_links(soup, base_url):
             continue
 
         path_lower = parsed_url.path.lower()
-        if any(kw in path_lower or kw in text for kw in ["contact", "about", "reach", "touch", "connect"]):
+        if any(kw in path_lower or kw in text for kw in ["contact", "about", "reach", "touch", "connect", "start", "book"]):
             if full_url not in links and parsed_url.path not in ["", "/"]:
                 links.append(full_url)
     return links[:5]  # limit to top 5 discovered links
@@ -220,7 +243,7 @@ def extract_contacts(base_url):
             continue
         checked_urls.add(url)
 
-        soup = get_soup(url)
+        soup, raw_html = get_soup(url)
 
         # On homepage, discover any specific contact/about subpage links dynamically
         if idx == 0 and soup:
@@ -229,16 +252,16 @@ def extract_contacts(base_url):
                 if link not in checked_urls and link not in subpages:
                     subpages.append(link)
 
-        e1, p1, ig1 = _scan_soup(soup)
+        e1, p1, ig1 = _scan_soup(soup, raw_html)
         emails |= e1
         phones |= p1
         if not instagram and ig1:
             instagram = ig1
 
-        # If no email found on fast path, try headless browser to render JS content
-        if not e1:
-            soup_r = get_soup_rendered(url)
-            e2, p2, ig2 = _scan_soup(soup_r)
+        # If any contact detail is missing, try headless Playwright browser to render JS & lazy footers
+        if not (e1 and p1 and ig1):
+            soup_r, raw_html_r = get_soup_rendered(url)
+            e2, p2, ig2 = _scan_soup(soup_r, raw_html_r)
             emails |= e2
             phones |= p2
             if not instagram and ig2:
@@ -247,5 +270,6 @@ def extract_contacts(base_url):
         time.sleep(DELAY_BETWEEN_PAGES)
 
     return list(emails), list(phones), instagram
+
 
 
