@@ -69,15 +69,27 @@ def _get_browser():
 
 
 def get_soup_rendered(url):
-    """Loads the page in a real (headless) browser, waits for its JavaScript
-    to finish running, then returns the fully-rendered HTML. Used only as a
-    fallback when the fast fetch finds nothing, since this is much slower."""
+    """Loads the page in a real (headless) browser, waits for it to load
+    and gives any late JavaScript a moment to finish, then returns the
+    fully-rendered HTML. Used only as a fallback when the fast fetch finds
+    nothing, since this is much slower.
+
+    Deliberately does NOT wait for full "network idle" — sites with a live
+    chat widget or analytics script that keeps polling in the background
+    would never go idle and we'd time out and lose everything. Waiting for
+    the page's load event, then a short fixed pause for JS to settle, is
+    more forgiving and still catches JS-injected content.
+    """
     try:
         browser = _get_browser()
         page = browser.new_page()
         try:
             page.set_default_timeout(RENDER_TIMEOUT_MS)
-            page.goto(url, wait_until="networkidle", timeout=RENDER_TIMEOUT_MS)
+            try:
+                page.goto(url, wait_until="load", timeout=RENDER_TIMEOUT_MS)
+            except Exception:
+                pass  # even a slow/incomplete load may have usable content by now
+            page.wait_for_timeout(1500)
             html = page.content()
             return BeautifulSoup(html, "html.parser")
         finally:
@@ -88,10 +100,15 @@ def get_soup_rendered(url):
 
 # ---------------- shared parsing of a page's contact info ----------------
 
+FAKE_PHONE_RE = re.compile(r"555.?01\d{2}")
+
+
 def clean_phone(raw):
     digits = re.sub(r"\D", "", raw)
     if len(digits) < 7:
         return None
+    if FAKE_PHONE_RE.search(raw):
+        return None  # 555-01xx is the reserved placeholder/fictional range
     return raw.strip()
 
 
@@ -102,14 +119,19 @@ def _scan_soup(soup):
     if not soup:
         return emails, phones, instagram
 
-    text = soup.get_text(" ")
-    for e in EMAIL_REGEX.findall(text):
-        if not e.lower().endswith(IMAGE_EXT):
-            emails.add(e.lower())
-    for p in PHONE_REGEX.findall(text):
-        cp = clean_phone(p)
-        if cp:
-            phones.add(cp)
+    # visible page text, checked two ways:
+    # - with spaces between elements (correct for normal flowing sentences)
+    # - with no spaces (catches "letter-split" animated headings some sites
+    #   use, e.g. HELLO@COMPANY.COM rendered as one <span> per character,
+    #   which the space-separated version would otherwise break apart)
+    for text in (soup.get_text(" "), soup.get_text("")):
+        for e in EMAIL_REGEX.findall(text):
+            if not e.lower().endswith(IMAGE_EXT):
+                emails.add(e.lower())
+        for p in PHONE_REGEX.findall(text):
+            cp = clean_phone(p)
+            if cp:
+                phones.add(cp)
 
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
