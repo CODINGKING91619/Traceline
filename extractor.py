@@ -124,14 +124,21 @@ def get_soup_rendered(url):
 
 # ---------------- shared parsing of a page's contact info ----------------
 
+PHONE_STRICT_REGEX = re.compile(r"(?:\+?1[\s.\-]?)?\(?([2-9]\d{2})\)?[\s.\-]?([2-9]\d{2})[\s.\-]?(\d{4})")
+
+
 def clean_phone(raw):
     digits = re.sub(r"\D", "", raw)
-    if len(digits) < 7:
+    # Valid phone numbers have 10 to 12 digits (e.g. 626-426-7235 or +1 626-426-7235)
+    if not (10 <= len(digits) <= 12):
         return None
     # 555-01xx (5550100 through 5550199) is the reserved placeholder/fictional range in North America
     if re.search(r"55501\d{2}", digits):
         return None
-    # Normalize phone formatting so duplicate variations (e.g. 8552652252, 855.265.2252, 855-265-2252) collapse into one entry
+    # Filter placeholder input values like (555) 123-4567 or 1234567890
+    if re.search(r"5551234567|1234567890", digits):
+        return None
+    # Normalize phone formatting so duplicate variations collapse into one entry
     if len(digits) == 10:
         return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
     elif len(digits) == 11 and digits.startswith("1"):
@@ -139,12 +146,15 @@ def clean_phone(raw):
     return raw.strip()
 
 
-def _scan_soup(soup, raw_html=""):
+def _scan_soup(soup, raw_html="", base_url="", fetched_scripts=None):
     """Pulls emails/phones/instagram out of one already-fetched page."""
     emails, phones = set(), set()
     instagram = None
     if not soup:
         return emails, phones, instagram
+
+    if fetched_scripts is None:
+        fetched_scripts = set()
 
     # 1. Standard spaced text extraction for clean reading of body text
     spaced_text = soup.get_text(" ")
@@ -161,18 +171,47 @@ def _scan_soup(soup, raw_html=""):
         if el.name in ("script", "style", "svg", "path", "img", "meta", "link"):
             continue
         el_text = el.get_text("")
-        if "@" in el_text and len(el_text) < 1000:
+        if "@" in el_text:
             for e in EMAIL_REGEX.findall(el_text):
                 if not e.lower().endswith(IMAGE_EXT):
                     emails.add(e.lower())
 
-    # 3. Raw HTML string & JSON-LD schema scanning (catches "email": "customerservice@socialeramedia.com")
+    # 3. Raw HTML string & JSON-LD schema scanning
     html_source = raw_html or str(soup)
     for e in EMAIL_REGEX.findall(html_source):
         el = e.lower()
-        if not el.endswith(IMAGE_EXT) and not any(ign in el for ign in ["w3.org", "schema.org", "domain.com", "example.com"]):
+        if not el.endswith(IMAGE_EXT) and not any(ign in el for ign in ["w3.org", "schema.org", "example.com", "yourcompany.com"]):
             emails.add(el)
 
+    # 4. External JS Bundle Scanning (catches phone/email stored in JS assets like index-DPpQS5OG.js)
+    if base_url:
+        base_netloc = urlparse(base_url).netloc.lower()
+        for script in soup.find_all("script", src=True):
+            src = urljoin(base_url, script["src"])
+            if src in fetched_scripts:
+                continue
+            if urlparse(src).netloc.lower() == base_netloc:
+                fetched_scripts.add(src)
+                try:
+                    resp = requests.get(src, headers=HEADERS, timeout=5)
+                    if resp.status_code == 200:
+                        text_js = resp.text
+                        for e in EMAIL_REGEX.findall(text_js):
+                            el = e.lower()
+                            if not el.endswith(IMAGE_EXT) and not any(x in el for x in ["w3.org", "schema.org", "example.com", "yourcompany.com"]):
+                                emails.add(el)
+                        for match in PHONE_STRICT_REGEX.finditer(text_js):
+                            start = match.start()
+                            if start > 0 and text_js[start - 1].isalnum():
+                                continue
+                            g1, g2, g3 = match.groups()
+                            if g2 == "555" and (g3.startswith("01") or g3 == "1234"):
+                                continue
+                            phones.add(f"+1 {g1}-{g2}-{g3}")
+                except Exception:
+                    pass
+
+    # 5. Mailto, Tel, Instagram links
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
 
@@ -236,6 +275,7 @@ def extract_contacts(base_url):
 
     subpages = list(DEFAULT_SUBPAGES)
     checked_urls = set()
+    fetched_scripts = set()
 
     for idx, path in enumerate(subpages):
         url = urljoin(base, path) if isinstance(path, str) and path.startswith("/") or path == "" else path
@@ -252,7 +292,7 @@ def extract_contacts(base_url):
                 if link not in checked_urls and link not in subpages:
                     subpages.append(link)
 
-        e1, p1, ig1 = _scan_soup(soup, raw_html)
+        e1, p1, ig1 = _scan_soup(soup, raw_html, base, fetched_scripts)
         emails |= e1
         phones |= p1
         if not instagram and ig1:
@@ -261,11 +301,15 @@ def extract_contacts(base_url):
         # If any contact detail is missing, try headless Playwright browser to render JS & lazy footers
         if not (e1 and p1 and ig1):
             soup_r, raw_html_r = get_soup_rendered(url)
-            e2, p2, ig2 = _scan_soup(soup_r, raw_html_r)
+            e2, p2, ig2 = _scan_soup(soup_r, raw_html_r, base, fetched_scripts)
             emails |= e2
             phones |= p2
             if not instagram and ig2:
                 instagram = ig2
+
+        # Early exit if all 3 fields are found
+        if emails and phones and instagram:
+            break
 
         time.sleep(DELAY_BETWEEN_PAGES)
 
