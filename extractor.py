@@ -31,6 +31,7 @@ DELAY_BETWEEN_PAGES = 0.5
 RENDER_TIMEOUT_MS = 15000
 HARD_RENDER_TIMEOUT_SEC = 22  # absolute ceiling per page, even if Playwright's own timeout fails to fire
 RECYCLE_BROWSER_EVERY = 40    # relaunch the browser periodically so a long batch can't slowly degrade it
+COMPANY_TIME_BUDGET_SEC = 75  # hard ceiling on total time spent per company, across all its subpages
 MAX_DISCOVERED_LINKS = 3
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
@@ -344,7 +345,9 @@ def find_contact_links(soup, base_url):
         if parsed_url.netloc.lower() != base_netloc:
             continue
         path_lower = parsed_url.path.lower()
-        if any(kw in path_lower or kw in text for kw in ("contact", "about", "reach", "touch", "connect")):
+        if any(kw in path_lower or kw in text for kw in
+               ("contact", "about", "reach", "touch", "connect", "consult",
+                "schedule", "book", "demo", "quote", "get-started", "started")):
             if full_url not in links and parsed_url.path not in ("", "/"):
                 links.append(full_url)
     return links[:MAX_DISCOVERED_LINKS]
@@ -367,8 +370,16 @@ def extract_contacts(base_url):
     subpages = list(DEFAULT_SUBPAGES)
     checked_urls = set()
     fetched_scripts = set()
+    company_start = time.time()
 
     for idx, path in enumerate(subpages):
+        if time.time() - company_start > COMPANY_TIME_BUDGET_SEC:
+            # this company has already eaten its fair share of run time --
+            # stop trying further subpages and move on with whatever was
+            # found so far, rather than letting one difficult site eat
+            # minutes that should go to the rest of the batch
+            break
+
         url = urljoin(base, path) if (path == "" or path.startswith("/")) else path
         if url in checked_urls:
             continue
