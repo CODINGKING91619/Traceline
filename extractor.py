@@ -54,7 +54,8 @@ IG_RESERVED = {
     "download", "app", "apps", "divider", "title", "feed", "tab", "films", "film", "menu",
     "header", "footer", "sidebar", "content", "wrapper", "container", "row", "col", "column",
     "grid", "button", "btn", "nav", "navbar", "modal", "dialog", "popup",
-    "square", "circle", "round", "icon", "icons", "logo", "logos", "banner", "banners", "avatar", "thumbnail", "thumb"
+    "square", "circle", "round", "icon", "icons", "logo", "logos", "banner", "banners", "avatar", "thumbnail", "thumb",
+    "before", "after", "above", "below", "next", "prev", "previous"
 }
 
 
@@ -106,15 +107,30 @@ def extract_ig_username(val):
         pass
     return None
 
-# ---------------- fast path: plain HTTP fetch ----------------
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_soup(url):
-    try:
-        resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers=HEADERS)
-        if resp.status_code == 200 and "text/html" in resp.headers.get("Content-Type", ""):
-            return BeautifulSoup(resp.text, "html.parser"), resp.text
-    except requests.RequestException:
-        return None, None
+    urls_to_try = []
+    if url.startswith("http://"):
+        urls_to_try.append("https://" + url[7:])
+        urls_to_try.append(url)
+    elif url.startswith("https://"):
+        urls_to_try.append(url)
+        urls_to_try.append("http://" + url[8:])
+    else:
+        urls_to_try.append("https://" + url)
+        urls_to_try.append("http://" + url)
+
+    for u in urls_to_try:
+        try:
+            resp = requests.get(u, timeout=REQUEST_TIMEOUT, headers=HEADERS, verify=False, allow_redirects=True)
+            if resp and resp.text:
+                ct = resp.headers.get("Content-Type", "").lower()
+                if "html" in ct or "<html" in resp.text[:500].lower() or "<body" in resp.text[:500].lower():
+                    return BeautifulSoup(resp.text, "html.parser"), resp.text
+        except Exception:
+            pass
     return None, None
 
 
