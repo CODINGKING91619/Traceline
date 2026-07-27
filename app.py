@@ -16,6 +16,7 @@ import csv
 import io
 import re
 import threading
+import time
 import uuid
 from urllib.parse import urlparse
 
@@ -29,17 +30,21 @@ JOBS = {}  # job_id -> dict(status, total, done, rows, current)
 JOBS_LOCK = threading.Lock()
 
 MAX_COMPANIES = 300
+STALE_JOB_MAX_AGE_SEC = 3 * 60 * 60  # 3 hours
 
 
-def instagram_username(url):
-    """Turns a full Instagram URL into just '@username'."""
-    if not url:
-        return None
-    path = urlparse(url).path.strip("/")
-    username = path.split("/")[0] if path else None
-    if not username:
-        return None
-    return "@" + username
+def _cleanup_stale_jobs():
+    """Removes old finished jobs that were never downloaded, so an abandoned
+    run (closed tab, failed run, etc.) doesn't sit in server memory forever.
+    Called opportunistically whenever a new run starts."""
+    now = time.time()
+    with JOBS_LOCK:
+        stale_ids = [
+            jid for jid, job in JOBS.items()
+            if job.get("status") == "complete" and now - job.get("created_at", now) > STALE_JOB_MAX_AGE_SEC
+        ]
+        for jid in stale_ids:
+            JOBS.pop(jid, None)
 
 
 PHONE_LINE_RE = re.compile(r"^\+?[\d\s\-().]{7,}$")
@@ -142,10 +147,9 @@ def run_job(job_id, companies):
             emails, phones, instagram = extract_contacts(site)
             if not phones and given_phone:
                 phones = [given_phone]
-            ig_username = instagram_username(instagram)
-            status = "found" if (emails or phones or ig_username) else "no data"
+            status = "found" if (emails or phones or instagram) else "no data"
         except Exception:
-            emails, ig_username = [], None
+            emails, instagram = [], None
             phones = [given_phone] if given_phone else []
             status = "error"
 
@@ -155,7 +159,7 @@ def run_job(job_id, companies):
                 "website": site,
                 "emails": ", ".join(emails),
                 "phones": ", ".join(phones),
-                "instagram": ig_username or "",
+                "instagram": instagram or "",
                 "status": status,
             })
             job["done"] += 1
@@ -172,6 +176,8 @@ def index():
 
 @app.route("/api/start", methods=["POST"])
 def start_job():
+    _cleanup_stale_jobs()
+
     companies = []
 
     if "file" in request.files and request.files["file"].filename:
@@ -190,7 +196,7 @@ def start_job():
     with JOBS_LOCK:
         JOBS[job_id] = {
             "status": "running", "total": len(companies), "done": 0,
-            "rows": [], "current": None,
+            "rows": [], "current": None, "created_at": time.time(),
         }
 
     thread = threading.Thread(target=run_job, args=(job_id, companies), daemon=True)
@@ -228,6 +234,13 @@ def download(job_id):
         writer.writerow([r["company"], r["website"], r["emails"], r["phones"], r["instagram"], r["status"]])
 
     mem = io.BytesIO(buf.getvalue().encode("utf-8"))
+
+    # Free the job's data from server memory now that it's safely copied into
+    # the response above -- without this, a long-running server would slowly
+    # accumulate every past run's results in memory forever.
+    with JOBS_LOCK:
+        JOBS.pop(job_id, None)
+
     return send_file(
         mem,
         mimetype="text/csv",

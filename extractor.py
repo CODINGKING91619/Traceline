@@ -24,8 +24,8 @@ from bs4 import BeautifulSoup
 SUBPAGES_TO_CHECK = ["", "/contact", "/contact-us", "/about", "/about-us"]
 REQUEST_TIMEOUT = 10
 DELAY_BETWEEN_PAGES = 0.5
-RENDER_TIMEOUT_MS = 15000
-HARD_RENDER_TIMEOUT_SEC = 22   # absolute ceiling per page render, even if Playwright's own timeout fails to fire
+RENDER_TIMEOUT_MS = 10000
+HARD_RENDER_TIMEOUT_SEC = 16   # absolute ceiling per page render, even if Playwright's own timeout fails to fire
 RECYCLE_BROWSER_EVERY = 40     # relaunch the browser periodically on long batches
 COMPANY_TIME_BUDGET_SEC = 60   # hard ceiling on total time spent per company, across all its subpages
 
@@ -163,7 +163,7 @@ def _get_soup_rendered_raw(url):
                 page.goto(url, wait_until="load", timeout=RENDER_TIMEOUT_MS)
             except Exception:
                 pass  # even a slow/incomplete load may have usable content by now
-            page.wait_for_timeout(1500)
+            page.wait_for_timeout(1000)
             html = page.content()
             return BeautifulSoup(html, "html.parser"), html
         finally:
@@ -388,10 +388,15 @@ def extract_contacts(base_url):
         if not instagram and ig1:
             instagram = ig1
 
-        # Fallback to slow JS renderer if:
-        # 1) Fast fetch found NOTHING at all on this page, OR
-        # 2) We are on the homepage (path == "") and instagram is STILL missing.
-        should_render = not (e1 or p1 or ig1) or (path == "" and not instagram)
+        # A page needs at least TWO of the three (email/phone/instagram) to
+        # count as "good enough" -- finding just one usually isn't enough to
+        # actually reach the company, so it's worth paying for the slow
+        # browser step to try to find a second (this applies to every
+        # subpage, not just the homepage -- a footer Instagram link can be
+        # JS-rendered on /contact or /about just as easily as on the
+        # homepage). Finding all 3 is a bonus, not required.
+        found_types = sum([bool(e1), bool(p1), bool(ig1)])
+        should_render = found_types < 2
         if should_render:
             soup_r, html_r = get_soup_rendered(url)
             e2, p2, ig2 = _scan_soup(soup_r, html_r)
@@ -399,6 +404,19 @@ def extract_contacts(base_url):
             phones |= p2
             if not instagram and ig2:
                 instagram = ig2
+
+        # If the first couple of pages (each already given a real chance,
+        # including the slow browser step) turned up absolutely nothing,
+        # it's unlikely later guessed pages will suddenly succeed --
+        # most companies in a typical batch have no findable contact info
+        # at all, so giving up early here is what keeps the overall batch
+        # fast instead of every "empty" company eating its full time budget.
+        pages_checked = SUBPAGES_TO_CHECK.index(path) + 1
+        if pages_checked >= 2 and not (emails or phones or instagram):
+            break
+
+        if sum([bool(emails), bool(phones), bool(instagram)]) >= 2:
+            break  # already found enough -- no need to keep checking pages
 
         time.sleep(DELAY_BETWEEN_PAGES)
 
