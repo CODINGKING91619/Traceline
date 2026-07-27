@@ -21,7 +21,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-SUBPAGES_TO_CHECK = ["", "/contact", "/contact-us", "/about", "/about-us"]
+SUBPAGES_TO_CHECK = ["", "/contact", "/contact-us", "/get-in-touch", "/about", "/about-us"]
 REQUEST_TIMEOUT = 6
 DELAY_BETWEEN_PAGES = 0.2
 RENDER_TIMEOUT_MS = 4000
@@ -37,7 +37,9 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
-    )
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 IG_RESERVED = {
@@ -51,7 +53,8 @@ IG_RESERVED = {
     "post", "posts", "media", "video", "videos", "image", "images", "photo", "photos",
     "download", "app", "apps", "divider", "title", "feed", "tab", "films", "film", "menu",
     "header", "footer", "sidebar", "content", "wrapper", "container", "row", "col", "column",
-    "grid", "button", "btn", "nav", "navbar", "modal", "dialog", "popup"
+    "grid", "button", "btn", "nav", "navbar", "modal", "dialog", "popup",
+    "square", "circle", "round", "icon", "icons", "logo", "logos", "banner", "banners", "avatar", "thumbnail", "thumb"
 }
 
 
@@ -115,6 +118,14 @@ def get_soup(url):
     return None, None
 
 
+import os
+import gc
+
+# Playwright (Chromium) uses ~350MB RAM which triggers Render's 512MB limit on batches of 50-250 companies.
+# Disabled by default so memory stays at ~30MB total. Set ENABLE_PLAYWRIGHT=1 in environment variables if needed.
+ENABLE_PLAYWRIGHT = os.environ.get("ENABLE_PLAYWRIGHT", "0").lower() in ("1", "true", "yes")
+DISABLE_PLAYWRIGHT = not ENABLE_PLAYWRIGHT
+
 # ---------------- slow path: headless browser (JS-rendered) ----------------
 
 _playwright = None
@@ -169,6 +180,7 @@ def _reset_browser():
             pass
         _browser = None
         _playwright = None
+    gc.collect()
 
 
 def _get_soup_rendered_raw(url):
@@ -205,12 +217,9 @@ def _get_soup_rendered_raw(url):
 
 
 def get_soup_rendered(url):
-    """Public entry point: runs the actual render in a background thread and
-    gives up after a hard ceiling no matter what Playwright itself is doing.
-    Playwright's own timeouts are best-effort and can fail to fire if the
-    browser process itself becomes unresponsive, so this is a second,
-    unconditional deadline on top of that -- this is what stops one bad
-    site from freezing an entire batch."""
+    if DISABLE_PLAYWRIGHT:
+        return None, None
+
     global _render_count
 
     result_queue = queue.Queue(maxsize=1)
@@ -437,11 +446,8 @@ def extract_contacts(base_url):
                 if not instagram and ig2:
                     instagram = ig2
 
-        # Fast exit: if we have found email or phone, or if 2 pages checked
-        pages_checked = SUBPAGES_TO_CHECK.index(path) + 1
-        if (emails or phones) and pages_checked >= 2:
-            break
-        if pages_checked >= 2 and not (emails or phones or instagram):
+        # Fast exit: if we have found email and phone, or any 2 contact types
+        if emails and phones:
             break
         if sum([bool(emails), bool(phones), bool(instagram)]) >= 2:
             break  # already found enough -- no need to keep checking pages
