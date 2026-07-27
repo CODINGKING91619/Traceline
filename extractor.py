@@ -471,4 +471,3 @@ def extract_contacts(base_url):
         time.sleep(DELAY_BETWEEN_PAGES)
 
     return list(emails), list(phones), instagram
-
