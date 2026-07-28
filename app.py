@@ -1,15 +1,5 @@
 """
 Contact Ledger — backend
--------------------------
-Self-serve web app: a user pastes or uploads a list of companies
-(name + website), the server scrapes each site for email / phone /
-Instagram in a background thread, the frontend polls for progress,
-and the finished results are downloadable as a CSV.
-
-Run:
-    pip install -r requirements.txt
-    python app.py
-Then open http://localhost:5000
 """
 
 import csv
@@ -26,17 +16,14 @@ from extractor import extract_contacts
 
 app = Flask(__name__)
 
-JOBS = {}  # job_id -> dict(status, total, done, rows, current)
+JOBS = {}
 JOBS_LOCK = threading.Lock()
 
 MAX_COMPANIES = 300
-STALE_JOB_MAX_AGE_SEC = 3 * 60 * 60  # 3 hours
+STALE_JOB_MAX_AGE_SEC = 3 * 60 * 60
 
 
 def _cleanup_stale_jobs():
-    """Removes old finished jobs that were never downloaded, so an abandoned
-    run (closed tab, failed run, etc.) doesn't sit in server memory forever.
-    Called opportunistically whenever a new run starts."""
     now = time.time()
     with JOBS_LOCK:
         stale_ids = [
@@ -52,11 +39,6 @@ URL_HINT_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
 
 
 def parse_input_text(raw_text):
-    """Handles company list inputs:
-    1) Standard CSV/TSV line per company: 'Company Name, https://site.com'
-    2) Multi-line blocks separated by blank lines
-    Returns a list of dicts: {"name": ..., "website": ..., "phone": ... or None}
-    """
     lines = raw_text.splitlines()
     companies = []
 
@@ -149,7 +131,6 @@ def index():
 @app.route("/api/start", methods=["POST"])
 def start_job():
     _cleanup_stale_jobs()
-
     companies = []
 
     if "file" in request.files and request.files["file"].filename:
@@ -207,9 +188,6 @@ def download(job_id):
 
     mem = io.BytesIO(buf.getvalue().encode("utf-8"))
 
-    # Free the job's data from server memory now that it's safely copied into
-    # the response above -- without this, a long-running server would slowly
-    # accumulate every past run's results in memory forever.
     with JOBS_LOCK:
         JOBS.pop(job_id, None)
 
