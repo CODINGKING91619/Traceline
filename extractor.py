@@ -129,15 +129,13 @@ def get_soup(url):
 
     for u in urls_to_try:
         try:
-            resp = requests.get(u, timeout=REQUEST_TIMEOUT, headers=HEADERS, verify=False, allow_redirects=True, stream=True)
-            if resp and resp.status_code == 200:
+            resp = requests.get(u, timeout=REQUEST_TIMEOUT, headers=HEADERS, verify=False, allow_redirects=True)
+            if resp and resp.text:
                 ct = resp.headers.get("Content-Type", "").lower()
-                # Skip binary media downloads immediately (images, videos, audio, pdf, zip)
                 if any(media in ct for media in ["image/", "video/", "audio/", "application/pdf", "font/", "zip"]):
                     continue
-                html_text = resp.text
-                if "html" in ct or "<html" in html_text[:500].lower() or "<body" in html_text[:500].lower():
-                    return BeautifulSoup(html_text, "html.parser"), html_text
+                if "html" in ct or "<html" in resp.text[:500].lower() or "<body" in resp.text[:500].lower():
+                    return BeautifulSoup(resp.text, "html.parser"), resp.text
         except Exception:
             pass
     return None, None
