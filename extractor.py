@@ -16,9 +16,9 @@ SUBPAGES_TO_CHECK = ["", "/contact", "/contact-us", "/get-in-touch", "/about", "
 REQUEST_TIMEOUT = 6
 DELAY_BETWEEN_PAGES = 0.2
 RENDER_TIMEOUT_MS = 4000
-HARD_RENDER_TIMEOUT_SEC = 6
-RECYCLE_BROWSER_EVERY = 10
-COMPANY_TIME_BUDGET_SEC = 25
+HARD_RENDER_TIMEOUT_SEC = 6   # absolute ceiling per page render
+RECYCLE_BROWSER_EVERY = 10     # relaunch browser frequently to keep RAM low on 512MB hosting
+COMPANY_TIME_BUDGET_SEC = 25   # hard ceiling on total time spent per company, across all its subpages
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 PHONE_REGEX = re.compile(r"(\+?\d[\d\-.\s()]{8,}\d)")
@@ -428,8 +428,8 @@ def extract_contacts(base_url):
         if not instagram and ig1:
             instagram = ig1
 
-        has_any_data = bool(emails or phones or instagram)
-        should_render = (not (e1 or p1 or ig1)) and (not has_any_data) and (not rendered_once)
+        # Fallback to headless browser render if Instagram is missing and Playwright is enabled
+        should_render = (not instagram) and (not rendered_once) and (not DISABLE_PLAYWRIGHT)
         if should_render:
             rendered_once = True
             soup_r, html_r = get_soup_rendered(url)
@@ -440,9 +440,8 @@ def extract_contacts(base_url):
                 if not instagram and ig2:
                     instagram = ig2
 
-        if emails and phones:
-            break
-        if sum([bool(emails), bool(phones), bool(instagram)]) >= 2:
+        # Only break early if ALL THREE (email, phone, AND instagram) are found!
+        if emails and phones and instagram:
             break
 
         time.sleep(DELAY_BETWEEN_PAGES)
