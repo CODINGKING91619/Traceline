@@ -1,15 +1,6 @@
 """
 Extraction engine: given a company website, finds email, phone, and Instagram.
 Kept separate from app.py so it can be tested or reused independently.
-
-Hybrid strategy: most sites are checked with a fast plain HTTP fetch. Only if
-that finds NOTHING AT ALL on a given page do we fall back to a real headless
-browser (Playwright) that runs the page's JavaScript -- this catches sites
-that inject their contact info client-side, at the cost of being much slower
-for that subset of sites. Deliberately kept lean: fewer guessed subpages and
-an early exit as soon as something is found, rather than exhaustively trying
-to find all of email+phone+Instagram together, since that dramatically
-increases how often the slow path fires.
 """
 
 import queue
@@ -25,9 +16,9 @@ SUBPAGES_TO_CHECK = ["", "/contact", "/contact-us", "/get-in-touch", "/about", "
 REQUEST_TIMEOUT = 6
 DELAY_BETWEEN_PAGES = 0.2
 RENDER_TIMEOUT_MS = 4000
-HARD_RENDER_TIMEOUT_SEC = 6   # absolute ceiling per page render, even if Playwright's own timeout fails to fire
-RECYCLE_BROWSER_EVERY = 10     # relaunch browser frequently to keep RAM low on 512MB hosting
-COMPANY_TIME_BUDGET_SEC = 25   # hard ceiling on total time spent per company, across all its subpages
+HARD_RENDER_TIMEOUT_SEC = 6
+RECYCLE_BROWSER_EVERY = 10
+COMPANY_TIME_BUDGET_SEC = 25
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 PHONE_REGEX = re.compile(r"(\+?\d[\d\-.\s()]{8,}\d)")
@@ -73,7 +64,6 @@ def extract_ig_username(val):
         if "instagram.com" in val.lower() or "instagr.am" in val.lower():
             val = "https://" + val
         else:
-            # Standalone username must have 2-30 chars, at least 1 letter, and not be reserved/dimension
             if (re.fullmatch(r"[a-zA-Z0-9._]{2,30}", val) and 
                 val.lower() not in IG_RESERVED and
                 re.search(r"[a-zA-Z]", val) and
@@ -172,12 +162,8 @@ def get_soup(url):
 import os
 import gc
 
-# Playwright (Chromium) uses ~350MB RAM which triggers Render's 512MB limit on batches of 50-250 companies.
-# Disabled by default so memory stays at ~30MB total. Set ENABLE_PLAYWRIGHT=1 in environment variables if needed.
 ENABLE_PLAYWRIGHT = os.environ.get("ENABLE_PLAYWRIGHT", "0").lower() in ("1", "true", "yes")
 DISABLE_PLAYWRIGHT = not ENABLE_PLAYWRIGHT
-
-# ---------------- slow path: headless browser (JS-rendered) ----------------
 
 _playwright = None
 _browser = None
@@ -186,9 +172,6 @@ _render_count = 0
 
 
 def _get_browser():
-    """Launches one shared headless Chromium instance, reused for the life
-    of the server process (launching a fresh browser per page would be far
-    too slow)."""
     global _playwright, _browser
     with _browser_lock:
         if _browser is None:
@@ -213,10 +196,6 @@ def _get_browser():
 
 
 def _reset_browser():
-    """Force-closes and discards the browser so the next call launches a
-    fresh one -- used after a stuck render, or periodically on long
-    batches, since a long-running instance can slowly become unstable
-    (especially under limited hosting RAM)."""
     global _browser, _playwright
     with _browser_lock:
         try:
@@ -235,21 +214,11 @@ def _reset_browser():
 
 
 def _get_soup_rendered_raw(url):
-    """Loads the page in a real (headless) browser, waits for it to load
-    and gives any late JavaScript a moment to finish, then returns the
-    fully-rendered HTML.
-
-    Deliberately does NOT wait for full "network idle" -- a page with a
-    live chat widget or analytics script polling in the background may
-    never go idle, which would time out and lose everything. Waiting for
-    the load event plus a short fixed pause is more forgiving.
-    """
     try:
         browser = _get_browser()
         page = browser.new_page()
         try:
             page.set_default_timeout(RENDER_TIMEOUT_MS)
-            # Abort heavy static assets to speed up JS rendering 3-5x
             try:
                 page.route("**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2,ttf,mp4,webm,ico}", lambda route: route.abort())
             except Exception:
@@ -257,7 +226,7 @@ def _get_soup_rendered_raw(url):
             try:
                 page.goto(url, wait_until="domcontentloaded", timeout=RENDER_TIMEOUT_MS)
             except Exception:
-                pass  # even a slow/incomplete load may have usable content by now
+                pass
             page.wait_for_timeout(500)
             html = page.content()
             return BeautifulSoup(html, "html.parser"), html
@@ -272,7 +241,6 @@ def get_soup_rendered(url):
         return None, None
 
     global _render_count
-
     result_queue = queue.Queue(maxsize=1)
 
     def worker():
@@ -301,23 +269,16 @@ def get_soup_rendered(url):
         return None, None
 
 
-# ---------------- phone cleaning ----------------
-
 def clean_phone(raw):
     digits = re.sub(r"\D", "", raw)
     if len(digits) < 7:
         return None
     if re.search(r"55501\d{2}", digits):
-        return None  # reserved fictional range (555-0100 to 555-0199)
+        return None
     return raw.strip()
 
 
-# ---------------- Cloudflare email de-obfuscation ----------------
-
 def decode_cf_email(cf_hex):
-    """Decodes Cloudflare's 'Email Protection' obfuscation
-    (data-cfemail="..." / /cdn-cgi/l/email-protection#...), which many
-    WordPress/Elementor sites use to hide mailto addresses from scrapers."""
     try:
         key = int(cf_hex[:2], 16)
         email_bytes = [int(cf_hex[i:i + 2], 16) ^ key for i in range(2, len(cf_hex), 2)]
@@ -329,17 +290,13 @@ def decode_cf_email(cf_hex):
     return None
 
 
-# ---------------- shared parsing of a page's contact info ----------------
-
 def _scan_soup(soup, html_text=None):
-    """Pulls emails/phones/instagram out of one already-fetched page."""
     emails, phones = set(), set()
     instagram = None
     if not soup and not html_text:
         return emails, phones, instagram
 
     if soup:
-        # Cloudflare-obfuscated emails
         for tag in soup.find_all(attrs={"data-cfemail": True}):
             dec = decode_cf_email(tag["data-cfemail"])
             if dec:
@@ -350,7 +307,6 @@ def _scan_soup(soup, html_text=None):
                 if dec:
                     emails.add(dec)
 
-        # visible text with normal spacing
         spaced_text = soup.get_text(" ")
         for e in EMAIL_REGEX.findall(spaced_text):
             if not e.lower().endswith(IMAGE_EXT):
@@ -360,7 +316,6 @@ def _scan_soup(soup, html_text=None):
             if cp:
                 phones.add(cp)
 
-        # letter-split animated headings
         for el in soup.find_all(True):
             if el.name in ("script", "style", "svg", "path", "img", "meta", "link"):
                 continue
@@ -375,7 +330,6 @@ def _scan_soup(soup, html_text=None):
                         if not e.lower().endswith(IMAGE_EXT):
                             emails.add(e.lower())
 
-        # mailto: / tel:
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             if href.lower().startswith("mailto:"):
@@ -387,11 +341,9 @@ def _scan_soup(soup, html_text=None):
                 if cp:
                     phones.add(cp)
 
-    # ---------------- Instagram Extraction ----------------
-    ig_candidates = []  # list of (score, username, url)
+    ig_candidates = []
 
     if soup:
-        # 1. Check all <a> tags with href
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
             uname = extract_ig_username(href)
@@ -410,7 +362,6 @@ def _scan_soup(soup, html_text=None):
                 score = 25 if is_priority else 7
                 ig_candidates.append((score, uname, f"https://www.instagram.com/{uname}/"))
 
-        # 2. Check other elements with data attributes, src, or onclick
         for tag in soup.find_all(True):
             for attr in ["data-href", "data-url", "data-src", "data-link", "src", "onclick"]:
                 val = tag.get(attr)
@@ -419,7 +370,6 @@ def _scan_soup(soup, html_text=None):
                     if uname:
                         ig_candidates.append((5, uname, f"https://www.instagram.com/{uname}/"))
 
-        # 3. Check JSON-LD, meta, link tags
         for tag in soup.find_all(["script", "meta", "link"]):
             content = tag.get_text() or tag.get("content") or tag.get("href") or ""
             if "instagram.com" in content.lower() or "instagr.am" in content.lower():
@@ -430,14 +380,12 @@ def _scan_soup(soup, html_text=None):
                         ig_candidates.append((6, uname, f"https://www.instagram.com/{uname}/"))
 
     if html_text:
-        # 4. Raw regex in HTML source
         matches = re.finditer(r"(?:https?:)?//(?:www\.)?(?:instagram\.com|instagr\.am)/([a-zA-Z0-9._]{1,30})", html_text, re.IGNORECASE)
         for m in matches:
             uname = extract_ig_username(m.group(1))
             if uname:
                 ig_candidates.append((4, uname, f"https://www.instagram.com/{uname}/"))
 
-        # 5. Mention patterns like Instagram: @username
         text_matches = re.finditer(r"(?:instagram|ig|insta)\s*[:@-]\s*@?([a-zA-Z0-9._]{2,30})", html_text, re.IGNORECASE)
         for m in text_matches:
             uname = extract_ig_username(m.group(1))
@@ -452,7 +400,6 @@ def _scan_soup(soup, html_text=None):
 
 
 def extract_contacts(base_url):
-    """Returns (emails: list[str], phones: list[str], instagram: str|None)"""
     emails, phones = set(), set()
     instagram = None
 
@@ -481,10 +428,6 @@ def extract_contacts(base_url):
         if not instagram and ig1:
             instagram = ig1
 
-        # Only fallback to headless browser render if plain HTTP returned
-        # NOTHING AT ALL on this subpage AND no previous subpage found anything.
-        # Instagram is not mandatory; if missing in standard HTML/footer,
-        # we do not waste time running headless browser rendering just for Instagram.
         has_any_data = bool(emails or phones or instagram)
         should_render = (not (e1 or p1 or ig1)) and (not has_any_data) and (not rendered_once)
         if should_render:
@@ -497,13 +440,11 @@ def extract_contacts(base_url):
                 if not instagram and ig2:
                     instagram = ig2
 
-        # Fast exit: if we have found email and phone, or any 2 contact types
         if emails and phones:
             break
         if sum([bool(emails), bool(phones), bool(instagram)]) >= 2:
-            break  # already found enough -- no need to keep checking pages
+            break
 
         time.sleep(DELAY_BETWEEN_PAGES)
 
     return list(emails), list(phones), instagram
-
