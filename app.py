@@ -91,21 +91,29 @@ def parse_input_csv(file_storage):
 
 def run_job(job_id, companies):
     job = JOBS[job_id]
-    for company in companies:
+    total = len(companies)
+    print(f"=== Starting Job {job_id} ({total} companies) ===", flush=True)
+
+    for idx, company in enumerate(companies, 1):
         name, site, given_phone = company["name"], company["website"], company.get("phone")
 
         with JOBS_LOCK:
             job["current"] = name
+
+        print(f"[{idx}/{total}] Scraping: {name} ({site})...", flush=True)
 
         try:
             emails, phones, instagram = extract_contacts(site)
             if not phones and given_phone:
                 phones = [given_phone]
             status = "found" if (emails or phones or instagram) else "no data"
-        except Exception:
+        except Exception as err:
+            print(f"[{idx}/{total}] ERROR scraping {site}: {err}", flush=True)
             emails, instagram = [], None
             phones = [given_phone] if given_phone else []
             status = "error"
+
+        print(f"[{idx}/{total}] DONE {name} -> Status: {status} | Emails: {len(emails)} | Phones: {len(phones)} | IG: {instagram}", flush=True)
 
         with JOBS_LOCK:
             job["rows"].append({
@@ -121,6 +129,8 @@ def run_job(job_id, companies):
     with JOBS_LOCK:
         job["current"] = None
         job["status"] = "complete"
+
+    print(f"=== Job {job_id} Complete ===", flush=True)
 
 
 @app.route("/")
