@@ -162,7 +162,8 @@ def get_soup(url):
 import os
 import gc
 
-ENABLE_PLAYWRIGHT = os.environ.get("ENABLE_PLAYWRIGHT", "0").lower() in ("1", "true", "yes")
+# Enable Playwright by default so headless browser renders client-side JS footers/widgets on hosting
+ENABLE_PLAYWRIGHT = os.environ.get("ENABLE_PLAYWRIGHT", "1").lower() in ("1", "true", "yes")
 DISABLE_PLAYWRIGHT = not ENABLE_PLAYWRIGHT
 
 _playwright = None
