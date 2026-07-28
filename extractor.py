@@ -111,16 +111,21 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_soup(url):
-    urls_to_try = []
-    if url.startswith("http://"):
-        urls_to_try.append("https://" + url[7:])
-        urls_to_try.append(url)
-    elif url.startswith("https://"):
-        urls_to_try.append(url)
-        urls_to_try.append("http://" + url[8:])
+    parsed = urlparse(url)
+    netloc = parsed.netloc or parsed.path.split("/")[0]
+    path = parsed.path if parsed.scheme else ""
+    if parsed.query:
+        path += "?" + parsed.query
+
+    if netloc.startswith("www."):
+        hosts = [netloc, netloc[4:]]
     else:
-        urls_to_try.append("https://" + url)
-        urls_to_try.append("http://" + url)
+        hosts = ["www." + netloc, netloc]
+
+    urls_to_try = []
+    for host in hosts:
+        urls_to_try.append(f"https://{host}{path}")
+        urls_to_try.append(f"http://{host}{path}")
 
     for u in urls_to_try:
         try:
@@ -471,3 +476,4 @@ def extract_contacts(base_url):
         time.sleep(DELAY_BETWEEN_PAGES)
 
     return list(emails), list(phones), instagram
+
