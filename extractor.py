@@ -2,17 +2,17 @@
 Extraction engine: given a company website, finds email, phone, and Instagram.
 Kept separate from app.py so it can be tested or reused independently.
 
-Staged strategy per page, cheapest first:
-  1. Fast plain HTTP fetch -- visible text, mailto/tel/instagram links,
-     Cloudflare-obfuscated email decoding, letter-split animated text.
-     Covers the large majority of sites almost instantly.
-  2. If that page found nothing at all: scan the site's own JS bundle files
-     for embedded contact info (still just HTTP requests, no browser).
-  3. If STILL nothing: fall back to a real headless browser (Playwright) to
-     run the page's JavaScript. This is the expensive step and is only used
-     when the cheaper steps genuinely found nothing on that page.
+Hybrid strategy: most sites are checked with a fast plain HTTP fetch. Only if
+that finds NOTHING AT ALL on a given page do we fall back to a real headless
+browser (Playwright) that runs the page's JavaScript -- this catches sites
+that inject their contact info client-side, at the cost of being much slower
+for that subset of sites. Deliberately kept lean: fewer guessed subpages and
+an early exit as soon as something is found, rather than exhaustively trying
+to find all of email+phone+Instagram together, since that dramatically
+increases how often the slow path fires.
 """
 
+import queue
 import re
 import threading
 import time
@@ -21,55 +21,142 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-DEFAULT_SUBPAGES = [
-    "", "/contact", "/contact-us", "/contacts", "/about", "/about-us",
-    "/get-started", "/get-in-touch",
-]
-REQUEST_TIMEOUT = 10
-DELAY_BETWEEN_PAGES = 0.5
-RENDER_TIMEOUT_MS = 15000
-MAX_DISCOVERED_LINKS = 3
+SUBPAGES_TO_CHECK = ["", "/contact", "/contact-us", "/get-in-touch", "/about", "/about-us"]
+REQUEST_TIMEOUT = 6
+DELAY_BETWEEN_PAGES = 0.2
+RENDER_TIMEOUT_MS = 4000
+HARD_RENDER_TIMEOUT_SEC = 6   # absolute ceiling per page render, even if Playwright's own timeout fails to fire
+RECYCLE_BROWSER_EVERY = 10     # relaunch browser frequently to keep RAM low on 512MB hosting
+COMPANY_TIME_BUDGET_SEC = 25   # hard ceiling on total time spent per company, across all its subpages
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 PHONE_REGEX = re.compile(r"(\+?\d[\d\-.\s()]{8,}\d)")
 IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")
-IGNORED_EMAIL_DOMAINS = ("w3.org", "schema.org", "example.com", "yourcompany.com", "sentry.io", "wixpress.com")
 
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/125.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# ---------------- fast path: plain HTTP fetch ----------------
+IG_RESERVED = {
+    "p", "reel", "reels", "stories", "story", "explore", "tv", "direct",
+    "accounts", "account", "sharer", "share", "developer", "developers", "about", "legal",
+    "privacy", "terms", "help", "blog", "press", "api", "graphql", "create",
+    "directory", "channel", "embed", "static", "style", "challenge", "location", "locations",
+    "tags", "oauth", "login", "signup", "auth", "advertising", "advertisers", "ads", "business",
+    "testimonial", "testimonials", "contact", "careers", "jobs", "pricing", "features",
+    "services", "home", "main", "index", "site", "link", "links", "bio", "profile", "profiles",
+    "post", "posts", "media", "video", "videos", "image", "images", "photo", "photos",
+    "download", "app", "apps", "divider", "title", "feed", "tab", "films", "film", "menu",
+    "header", "footer", "sidebar", "content", "wrapper", "container", "row", "col", "column",
+    "grid", "button", "btn", "nav", "navbar", "modal", "dialog", "popup",
+    "square", "circle", "round", "icon", "icons", "logo", "logos", "banner", "banners", "avatar", "thumbnail", "thumb",
+    "before", "after", "above", "below", "next", "prev", "previous"
+}
+
+
+def extract_ig_username(val):
+    """Extracts valid Instagram username from a URL, handle, or string."""
+    if not val:
+        return None
+    val = str(val).strip()
+    if val.startswith("@"):
+        val = val[1:].strip()
+
+    if val.startswith("//"):
+        val = "https:" + val
+    elif not val.startswith(("http://", "https://")):
+        if "instagram.com" in val.lower() or "instagr.am" in val.lower():
+            val = "https://" + val
+        else:
+            # Standalone username must have 2-30 chars, at least 1 letter, and not be reserved/dimension
+            if (re.fullmatch(r"[a-zA-Z0-9._]{2,30}", val) and 
+                val.lower() not in IG_RESERVED and
+                re.search(r"[a-zA-Z]", val) and
+                not val.lower().endswith((".html", ".htm", ".php", ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")) and
+                not re.fullmatch(r"\d+x\d+", val.lower())):
+                return val
+            return None
+
+    try:
+        parsed = urlparse(val)
+        netloc = parsed.netloc.lower()
+        if "instagram.com" not in netloc and "instagr.am" not in netloc:
+            return None
+
+        path_parts = [p for p in parsed.path.strip("/").split("/") if p]
+        if not path_parts:
+            return None
+
+        username = path_parts[0]
+        if username.lower() in IG_RESERVED:
+            return None
+
+        if username.lower().endswith((".html", ".htm", ".php", ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp")):
+            return None
+
+        if (re.fullmatch(r"[a-zA-Z0-9._]{1,30}", username) and
+            re.search(r"[a-zA-Z]", username) and
+            not re.fullmatch(r"\d+x\d+", username.lower())):
+            return username
+    except Exception:
+        pass
+    return None
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def get_soup(url):
-    """Fetches a URL, falling back from https to http if needed.
-    Returns (soup, raw_html) or (None, "") on failure."""
-    urls_to_try = [url]
-    if url.startswith("https://"):
-        urls_to_try.append(url.replace("https://", "http://", 1))
+    parsed = urlparse(url)
+    netloc = parsed.netloc or parsed.path.split("/")[0]
+    path = parsed.path if parsed.scheme else ""
+    if parsed.query:
+        path += "?" + parsed.query
+
+    if netloc.startswith("www."):
+        hosts = [netloc, netloc[4:]]
+    else:
+        hosts = ["www." + netloc, netloc]
+
+    urls_to_try = []
+    for host in hosts:
+        urls_to_try.append(f"https://{host}{path}")
+        urls_to_try.append(f"http://{host}{path}")
 
     for u in urls_to_try:
         try:
-            resp = requests.get(u, timeout=REQUEST_TIMEOUT, headers=HEADERS, allow_redirects=True)
-            if resp.status_code == 200:
+            resp = requests.get(u, timeout=REQUEST_TIMEOUT, headers=HEADERS, verify=False, allow_redirects=True, stream=True)
+            if resp and resp.status_code == 200:
                 ct = resp.headers.get("Content-Type", "").lower()
-                if not ct or "text/html" in ct or "xhtml" in ct:
-                    return BeautifulSoup(resp.text, "html.parser"), resp.text
-        except requests.RequestException:
-            continue
-    return None, ""
+                # Skip binary media downloads immediately (images, videos, audio, pdf, zip)
+                if any(media in ct for media in ["image/", "video/", "audio/", "application/pdf", "font/", "zip"]):
+                    continue
+                html_text = resp.text
+                if "html" in ct or "<html" in html_text[:500].lower() or "<body" in html_text[:500].lower():
+                    return BeautifulSoup(html_text, "html.parser"), html_text
+        except Exception:
+            pass
+    return None, None
 
+
+import os
+import gc
+
+# Playwright (Chromium) uses ~350MB RAM which triggers Render's 512MB limit on batches of 50-250 companies.
+# Disabled by default so memory stays at ~30MB total. Set ENABLE_PLAYWRIGHT=1 in environment variables if needed.
+ENABLE_PLAYWRIGHT = os.environ.get("ENABLE_PLAYWRIGHT", "0").lower() in ("1", "true", "yes")
+DISABLE_PLAYWRIGHT = not ENABLE_PLAYWRIGHT
 
 # ---------------- slow path: headless browser (JS-rendered) ----------------
 
 _playwright = None
 _browser = None
 _browser_lock = threading.Lock()
+_render_count = 0
 
 
 def _get_browser():
@@ -83,59 +170,119 @@ def _get_browser():
             _playwright = sync_playwright().start()
             _browser = _playwright.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--js-flags=--max-old-space-size=128",
+                    "--no-zygote",
+                    "--disable-extensions",
+                    "--disable-component-extensions-with-background-pages",
+                    "--disable-default-apps",
+                    "--mute-audio",
+                    "--no-first-run",
+                ],
             )
         return _browser
 
 
-def get_soup_rendered(url):
-    """Loads the page in a real headless browser, waits for it to load plus
-    a short pause for late JS, then returns the rendered HTML.
+def _reset_browser():
+    """Force-closes and discards the browser so the next call launches a
+    fresh one -- used after a stuck render, or periodically on long
+    batches, since a long-running instance can slowly become unstable
+    (especially under limited hosting RAM)."""
+    global _browser, _playwright
+    with _browser_lock:
+        try:
+            if _browser:
+                _browser.close()
+        except Exception:
+            pass
+        try:
+            if _playwright:
+                _playwright.stop()
+        except Exception:
+            pass
+        _browser = None
+        _playwright = None
+    gc.collect()
 
-    Deliberately does NOT wait for full "network idle" -- a page with a live
-    chat widget or analytics polling in the background may never go idle,
-    which would time out and lose everything. Waiting for the load event
-    plus a fixed pause is more forgiving.
+
+def _get_soup_rendered_raw(url):
+    """Loads the page in a real (headless) browser, waits for it to load
+    and gives any late JavaScript a moment to finish, then returns the
+    fully-rendered HTML.
+
+    Deliberately does NOT wait for full "network idle" -- a page with a
+    live chat widget or analytics script polling in the background may
+    never go idle, which would time out and lose everything. Waiting for
+    the load event plus a short fixed pause is more forgiving.
     """
     try:
         browser = _get_browser()
-        context = browser.new_context(user_agent=HEADERS["User-Agent"], viewport={"width": 1280, "height": 900})
-        page = context.new_page()
+        page = browser.new_page()
         try:
             page.set_default_timeout(RENDER_TIMEOUT_MS)
+            # Abort heavy static assets to speed up JS rendering 3-5x
             try:
-                page.goto(url, wait_until="load", timeout=RENDER_TIMEOUT_MS)
-            except Exception:
-                pass  # even an incomplete load may have usable content by now
-            page.wait_for_timeout(1200)
-            try:
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                page.wait_for_timeout(800)
+                page.route("**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2,ttf,mp4,webm,ico}", lambda route: route.abort())
             except Exception:
                 pass
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=RENDER_TIMEOUT_MS)
+            except Exception:
+                pass  # even a slow/incomplete load may have usable content by now
+            page.wait_for_timeout(500)
             html = page.content()
             return BeautifulSoup(html, "html.parser"), html
         finally:
             page.close()
-            context.close()
     except Exception:
-        return None, ""
+        return None, None
+
+
+def get_soup_rendered(url):
+    if DISABLE_PLAYWRIGHT:
+        return None, None
+
+    global _render_count
+
+    result_queue = queue.Queue(maxsize=1)
+
+    def worker():
+        try:
+            result_queue.put(_get_soup_rendered_raw(url))
+        except Exception:
+            result_queue.put((None, None))
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(HARD_RENDER_TIMEOUT_SEC)
+
+    if t.is_alive():
+        _reset_browser()
+        return None, None
+
+    with _browser_lock:
+        _render_count += 1
+        should_recycle = _render_count % RECYCLE_BROWSER_EVERY == 0
+    if should_recycle:
+        _reset_browser()
+
+    try:
+        return result_queue.get_nowait()
+    except queue.Empty:
+        return None, None
 
 
 # ---------------- phone cleaning ----------------
 
 def clean_phone(raw):
     digits = re.sub(r"\D", "", raw)
-    if not (10 <= len(digits) <= 12):
+    if len(digits) < 7:
         return None
     if re.search(r"55501\d{2}", digits):
-        return None  # reserved fictional range
-    if re.search(r"5551234567|1234567890", digits):
-        return None  # obvious placeholder values
-    if len(digits) == 10:
-        return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}"
-    if len(digits) == 11 and digits.startswith("1"):
-        return f"+1 {digits[1:4]}-{digits[4:7]}-{digits[7:]}"
+        return None  # reserved fictional range (555-0100 to 555-0199)
     return raw.strip()
 
 
@@ -158,126 +305,124 @@ def decode_cf_email(cf_hex):
 
 # ---------------- shared parsing of a page's contact info ----------------
 
-def _scan_soup(soup, raw_html=""):
-    """Pulls emails/phones/instagram out of one already-fetched page using
-    only cheap, already-downloaded data (no extra network requests)."""
+def _scan_soup(soup, html_text=None):
+    """Pulls emails/phones/instagram out of one already-fetched page."""
     emails, phones = set(), set()
     instagram = None
-    if not soup:
+    if not soup and not html_text:
         return emails, phones, instagram
 
-    # Cloudflare-obfuscated emails
-    for tag in soup.find_all(attrs={"data-cfemail": True}):
-        dec = decode_cf_email(tag["data-cfemail"])
-        if dec:
-            emails.add(dec)
-    for a in soup.find_all("a", href=True):
-        if "email-protection" in a["href"]:
-            dec = decode_cf_email(a["href"].split("#")[-1])
+    if soup:
+        # Cloudflare-obfuscated emails
+        for tag in soup.find_all(attrs={"data-cfemail": True}):
+            dec = decode_cf_email(tag["data-cfemail"])
             if dec:
                 emails.add(dec)
+        for a in soup.find_all("a", href=True):
+            if "email-protection" in a["href"]:
+                dec = decode_cf_email(a["href"].split("#")[-1])
+                if dec:
+                    emails.add(dec)
 
-    # visible text with normal spacing -- safe to scan as one block since
-    # spaces between elements prevent unrelated text from merging together
-    spaced_text = soup.get_text(" ")
-    for e in EMAIL_REGEX.findall(spaced_text):
-        if not e.lower().endswith(IMAGE_EXT):
-            emails.add(e.lower())
-    for p in PHONE_REGEX.findall(spaced_text):
-        cp = clean_phone(p)
-        if cp:
-            phones.add(cp)
-
-    # letter-split animated headings (one <span> per character) need a
-    # no-space join to read as one email -- but joining the WHOLE page with
-    # no spaces risks merging two unrelated elements into a fake address
-    # (e.g. "...company.COM" + "Fake: 213..." -> "company.comfake"). Scanning
-    # each element's own text separately avoids that, since it only sees
-    # that element's own descendants, never its siblings.
-    for el in soup.find_all(True):
-        if el.name in ("script", "style", "svg", "path", "img", "meta", "link"):
-            continue
-        direct_children = [c for c in el.children if getattr(c, "name", None)]
-        if len(direct_children) < 4:
-            continue
-        child_texts = [c.get_text("") for c in direct_children]
-        if all(0 < len(t) <= 2 for t in child_texts):
-            joined = "".join(child_texts)
-            if "@" in joined:
-                for e in EMAIL_REGEX.findall(joined):
-                    if not e.lower().endswith(IMAGE_EXT):
-                        emails.add(e.lower())
-
-    # mailto: / tel: / instagram links
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if href.lower().startswith("mailto:"):
-            addr = href[7:].split("?")[0].strip()
-            if EMAIL_REGEX.fullmatch(addr) and not addr.lower().endswith(IMAGE_EXT):
-                emails.add(addr.lower())
-        elif href.lower().startswith("tel:"):
-            cp = clean_phone(href[4:].strip())
+        # visible text with normal spacing
+        spaced_text = soup.get_text(" ")
+        for e in EMAIL_REGEX.findall(spaced_text):
+            if not e.lower().endswith(IMAGE_EXT):
+                emails.add(e.lower())
+        for p in PHONE_REGEX.findall(spaced_text):
+            cp = clean_phone(p)
             if cp:
                 phones.add(cp)
-        elif not instagram and ("instagram.com" in href or "instagr.am" in href):
-            if "/p/" not in href and "/reel/" not in href:
-                instagram = href.split("?")[0]
 
-    return emails, phones, instagram
-
-
-def _scan_js_bundles(soup, base_url, fetched_scripts):
-    """Cheaper alternative to launching a browser: downloads the site's own
-    same-domain JS files as plain text and regex-scans them. Catches contact
-    info that JS frameworks embed in their bundle rather than the HTML."""
-    emails, phones = set(), set()
-    if not soup or not base_url:
-        return emails, phones
-
-    base_netloc = urlparse(base_url).netloc.lower()
-    for script in soup.find_all("script", src=True):
-        src = urljoin(base_url, script["src"])
-        if src in fetched_scripts or urlparse(src).netloc.lower() != base_netloc:
-            continue
-        fetched_scripts.add(src)
-        try:
-            resp = requests.get(src, headers=HEADERS, timeout=5)
-            if resp.status_code != 200:
+        # letter-split animated headings
+        for el in soup.find_all(True):
+            if el.name in ("script", "style", "svg", "path", "img", "meta", "link"):
                 continue
-            text_js = resp.text
-            for e in EMAIL_REGEX.findall(text_js):
-                el = e.lower()
-                if not el.endswith(IMAGE_EXT) and not any(d in el for d in IGNORED_EMAIL_DOMAINS):
-                    emails.add(el)
-            for p in PHONE_REGEX.findall(text_js):
-                cp = clean_phone(p)
+            direct_children = [c for c in el.children if getattr(c, "name", None)]
+            if len(direct_children) < 4:
+                continue
+            child_texts = [c.get_text("") for c in direct_children]
+            if all(0 < len(t) <= 2 for t in child_texts):
+                joined = "".join(child_texts)
+                if "@" in joined:
+                    for e in EMAIL_REGEX.findall(joined):
+                        if not e.lower().endswith(IMAGE_EXT):
+                            emails.add(e.lower())
+
+        # mailto: / tel:
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            if href.lower().startswith("mailto:"):
+                addr = href[7:].split("?")[0].strip()
+                if EMAIL_REGEX.fullmatch(addr) and not addr.lower().endswith(IMAGE_EXT):
+                    emails.add(addr.lower())
+            elif href.lower().startswith("tel:"):
+                cp = clean_phone(href[4:].strip())
                 if cp:
                     phones.add(cp)
-        except requests.RequestException:
-            continue
 
-    return emails, phones
+    # ---------------- Instagram Extraction ----------------
+    ig_candidates = []  # list of (score, username, url)
 
+    if soup:
+        # 1. Check all <a> tags with href
+        for a in soup.find_all("a", href=True):
+            href = a["href"].strip()
+            uname = extract_ig_username(href)
+            if uname:
+                is_priority = False
+                parent = a.parent
+                for _ in range(5):
+                    if parent and getattr(parent, "name", None):
+                        tag_str = (str(parent.get("class", [])) + str(parent.get("id", "")) + parent.name).lower()
+                        if any(k in tag_str for k in ["footer", "social", "header", "follow", "nav"]):
+                            is_priority = True
+                            break
+                        parent = parent.parent
+                    else:
+                        break
+                score = 25 if is_priority else 7
+                ig_candidates.append((score, uname, f"https://www.instagram.com/{uname}/"))
 
-def find_contact_links(soup, base_url):
-    """Finds a few likely contact/about page links from the homepage's own
-    navigation, as a supplement to the fixed guess-list of common paths."""
-    links = []
-    if not soup:
-        return links
-    base_netloc = urlparse(base_url).netloc.lower()
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        text = a.get_text(" ").lower()
-        full_url = urljoin(base_url, href)
-        parsed_url = urlparse(full_url)
-        if parsed_url.netloc.lower() != base_netloc:
-            continue
-        path_lower = parsed_url.path.lower()
-        if any(kw in path_lower or kw in text for kw in ("contact", "about", "reach", "touch", "connect")):
-            if full_url not in links and parsed_url.path not in ("", "/"):
-                links.append(full_url)
-    return links[:MAX_DISCOVERED_LINKS]
+        # 2. Check other elements with data attributes, src, or onclick
+        for tag in soup.find_all(True):
+            for attr in ["data-href", "data-url", "data-src", "data-link", "src", "onclick"]:
+                val = tag.get(attr)
+                if val and ("instagram.com" in str(val).lower() or "instagr.am" in str(val).lower()):
+                    uname = extract_ig_username(str(val))
+                    if uname:
+                        ig_candidates.append((5, uname, f"https://www.instagram.com/{uname}/"))
+
+        # 3. Check JSON-LD, meta, link tags
+        for tag in soup.find_all(["script", "meta", "link"]):
+            content = tag.get_text() or tag.get("content") or tag.get("href") or ""
+            if "instagram.com" in content.lower() or "instagr.am" in content.lower():
+                matches = re.finditer(r"(?:https?:)?//(?:www\.)?(?:instagram\.com|instagr\.am)/([a-zA-Z0-9._]{1,30})", content, re.IGNORECASE)
+                for m in matches:
+                    uname = extract_ig_username(m.group(1))
+                    if uname:
+                        ig_candidates.append((6, uname, f"https://www.instagram.com/{uname}/"))
+
+    if html_text:
+        # 4. Raw regex in HTML source
+        matches = re.finditer(r"(?:https?:)?//(?:www\.)?(?:instagram\.com|instagr\.am)/([a-zA-Z0-9._]{1,30})", html_text, re.IGNORECASE)
+        for m in matches:
+            uname = extract_ig_username(m.group(1))
+            if uname:
+                ig_candidates.append((4, uname, f"https://www.instagram.com/{uname}/"))
+
+        # 5. Mention patterns like Instagram: @username
+        text_matches = re.finditer(r"(?:instagram|ig|insta)\s*[:@-]\s*@?([a-zA-Z0-9._]{2,30})", html_text, re.IGNORECASE)
+        for m in text_matches:
+            uname = extract_ig_username(m.group(1))
+            if uname and not uname.lower().endswith((".com", ".net", ".org", ".png", ".jpg", ".js", ".css")):
+                ig_candidates.append((3, uname, f"https://www.instagram.com/{uname}/"))
+
+    if ig_candidates:
+        ig_candidates.sort(key=lambda x: x[0], reverse=True)
+        instagram = ig_candidates[0][2]
+
+    return emails, phones, instagram
 
 
 def extract_contacts(base_url):
@@ -294,51 +439,45 @@ def extract_contacts(base_url):
     parsed = urlparse(base_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
 
-    subpages = list(DEFAULT_SUBPAGES)
-    checked_urls = set()
-    fetched_scripts = set()
+    company_start = time.time()
+    rendered_once = False
 
-    for idx, path in enumerate(subpages):
-        url = urljoin(base, path) if (path == "" or path.startswith("/")) else path
-        if url in checked_urls:
-            continue
-        checked_urls.add(url)
+    for path in SUBPAGES_TO_CHECK:
+        if time.time() - company_start > COMPANY_TIME_BUDGET_SEC:
+            break
 
-        # -------- stage 1: fast fetch --------
-        soup, raw_html = get_soup(url)
+        url = urljoin(base, path)
 
-        if idx == 0 and soup:
-            for link in find_contact_links(soup, base):
-                if link not in checked_urls and link not in subpages:
-                    subpages.append(link)
-
-        e1, p1, ig1 = _scan_soup(soup, raw_html)
+        soup, html_text = get_soup(url)
+        e1, p1, ig1 = _scan_soup(soup, html_text)
         emails |= e1
         phones |= p1
         if not instagram and ig1:
             instagram = ig1
 
-        found_anything_on_page = bool(e1 or p1 or ig1)
+        # Only fallback to headless browser render if plain HTTP returned
+        # NOTHING AT ALL on this subpage AND no previous subpage found anything.
+        # Instagram is not mandatory; if missing in standard HTML/footer,
+        # we do not waste time running headless browser rendering just for Instagram.
+        has_any_data = bool(emails or phones or instagram)
+        should_render = (not (e1 or p1 or ig1)) and (not has_any_data) and (not rendered_once)
+        if should_render:
+            rendered_once = True
+            soup_r, html_r = get_soup_rendered(url)
+            if soup_r or html_r:
+                e2, p2, ig2 = _scan_soup(soup_r, html_r)
+                emails |= e2
+                phones |= p2
+                if not instagram and ig2:
+                    instagram = ig2
 
-        # -------- stage 2: JS bundle scan (still no browser) --------
-        if not found_anything_on_page and soup:
-            e2, p2 = _scan_js_bundles(soup, base, fetched_scripts)
-            emails |= e2
-            phones |= p2
-            found_anything_on_page = bool(e2 or p2)
-
-        # -------- stage 3: headless browser (only if truly nothing found) --------
-        if not found_anything_on_page:
-            soup_r, raw_html_r = get_soup_rendered(url)
-            e3, p3, ig3 = _scan_soup(soup_r, raw_html_r)
-            emails |= e3
-            phones |= p3
-            if not instagram and ig3:
-                instagram = ig3
-
-        if emails and phones and instagram:
+        # Fast exit: if we have found email and phone, or any 2 contact types
+        if emails and phones:
             break
+        if sum([bool(emails), bool(phones), bool(instagram)]) >= 2:
+            break  # already found enough -- no need to keep checking pages
 
         time.sleep(DELAY_BETWEEN_PAGES)
 
     return list(emails), list(phones), instagram
+

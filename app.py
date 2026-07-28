@@ -52,64 +52,36 @@ URL_HINT_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
 
 
 def parse_input_text(raw_text):
-    """Handles two paste formats:
-    1) One line per company: 'Company Name, https://site.com' (comma or tab separated)
-    2) Multi-line blocks separated by blank lines, e.g.:
-         Company Name
-             1 303-718-2001
-             https://site.com
-       (common when pasting straight out of a spreadsheet or directory export)
+    """Handles company list inputs:
+    1) Standard CSV/TSV line per company: 'Company Name, https://site.com'
+    2) Multi-line blocks separated by blank lines
     Returns a list of dicts: {"name": ..., "website": ..., "phone": ... or None}
     """
     lines = raw_text.splitlines()
     companies = []
 
-    def flush(block):
-        name, website, phone = None, None, None
-        for raw_line in block:
-            line = raw_line.strip()
-            if not line:
-                continue
-            if URL_HINT_RE.search(line) and website is None:
-                website = line
-            elif PHONE_LINE_RE.match(line) and phone is None:
-                phone = line
-            elif name is None:
-                name = line
-        if name and website:
-            return {"name": name, "website": website, "phone": phone}
-        return None
-
-    block = []
     for line in lines:
-        if line.strip() == "":
-            continue  # ignore truly blank lines
-        leading_ws = len(line) - len(line.lstrip(" \t"))
-        if leading_ws == 0:
-            # a line with no indentation starts a new company record
-            result = flush(block)
-            if result:
-                companies.append(result)
-            block = [line]
-        else:
-            block.append(line)
-    result = flush(block)
-    if result:
-        companies.append(result)
+        line = line.strip()
+        if not line:
+            continue
 
-    # Fallback: simple one-line "Name, Website" paste (only if block parsing found nothing)
-    if not companies:
-        for line in lines:
-            line = line.strip()
-            if not line:
+        parts = [p.strip() for p in re.split(r"\t|,", line) if p.strip()]
+        if len(parts) >= 2:
+            name, site = parts[0], parts[1]
+            phone = parts[2] if len(parts) > 2 and PHONE_LINE_RE.match(parts[2]) else None
+            
+            if name.lower() in ("company_name", "company name", "company", "name") and "http" not in site.lower():
                 continue
-            parts = re.split(r"\t|,", line, maxsplit=1)
-            if len(parts) == 2:
-                name, site = parts[0].strip(), parts[1].strip()
-                if name.lower() in ("company_name", "company", "name") and "http" not in site.lower():
-                    continue
-                if name and site and URL_HINT_RE.search(site):
-                    companies.append({"name": name, "website": site, "phone": None})
+            if URL_HINT_RE.search(site):
+                companies.append({"name": name, "website": site, "phone": phone})
+                continue
+            elif URL_HINT_RE.search(name):
+                companies.append({"name": site, "website": name, "phone": phone})
+                continue
+
+        if URL_HINT_RE.search(line):
+            domain = urlparse(line if line.startswith("http") else "https://" + line).netloc or line
+            companies.append({"name": domain, "website": line, "phone": None})
 
     return companies
 
