@@ -21,12 +21,12 @@ from urllib.parse import urljoin, urlparse
 import requests
 from bs4 import BeautifulSoup
 
-SUBPAGES_TO_CHECK = ["", "/contact", "/contact-us", "/about", "/about-us"]
+SUBPAGES_TO_CHECK = ["", "/contact"]  # homepage (footer) + one contact-page guess. Kept deliberately short -- each extra page is another possible browser render, which is what was pushing memory usage too high on Render's free tier.
 REQUEST_TIMEOUT = 10
 DELAY_BETWEEN_PAGES = 0.5
 RENDER_TIMEOUT_MS = 10000
 HARD_RENDER_TIMEOUT_SEC = 16   # absolute ceiling per page render, even if Playwright's own timeout fails to fire
-RECYCLE_BROWSER_EVERY = 40     # relaunch the browser periodically on long batches
+RECYCLE_BROWSER_EVERY = 12    # relaunch the browser periodically on long batches -- more aggressive given constrained hosting memory
 COMPANY_TIME_BUDGET_SEC = 60   # hard ceiling on total time spent per company, across all its subpages
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
@@ -118,7 +118,21 @@ def _get_browser():
             _playwright = sync_playwright().start()
             _browser = _playwright.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-default-apps",
+                    "--disable-sync",
+                    "--disable-translate",
+                    "--metrics-recording-only",
+                    "--mute-audio",
+                    "--no-first-run",
+                    "--single-process",
+                    "--js-flags=--max-old-space-size=128",
+                ],
             )
         return _browser
 
@@ -153,11 +167,23 @@ def _get_soup_rendered_raw(url):
     live chat widget or analytics script polling in the background may
     never go idle, which would time out and lose everything. Waiting for
     the load event plus a short fixed pause is more forgiving.
+
+    Also deliberately blocks images/video/fonts/stylesheets from loading --
+    we only need the page's text and links, not what it visually looks
+    like, and those asset types are usually what makes a real browser's
+    memory usage balloon on image/video-heavy marketing sites. This is the
+    main lever for staying under a constrained hosting memory limit.
     """
     try:
         browser = _get_browser()
         page = browser.new_page()
         try:
+            page.route(
+                "**/*",
+                lambda route: route.abort()
+                if route.request.resource_type in ("image", "media", "font", "stylesheet")
+                else route.continue_(),
+            )
             page.set_default_timeout(RENDER_TIMEOUT_MS)
             try:
                 page.goto(url, wait_until="load", timeout=RENDER_TIMEOUT_MS)
@@ -299,6 +325,27 @@ def _scan_soup(soup, html_text=None):
     ig_candidates = []  # list of (score, username, url)
 
     if soup:
+        # 0. Dedicated footer-first pass -- the Instagram link is almost
+        # always in the site's <footer>, so check there specifically first
+        # and score it above everything else, rather than relying only on
+        # the general ancestor-keyword check below to catch it correctly.
+        for footer_tag in soup.find_all("footer"):
+            for a in footer_tag.find_all("a", href=True):
+                uname = extract_ig_username(a["href"].strip())
+                if uname:
+                    ig_candidates.append((20, uname, f"https://www.instagram.com/{uname}/"))
+
+        # some sites use a plain <div class="footer"> instead of the
+        # semantic <footer> tag -- catch those too
+        for footer_like in soup.find_all(
+            lambda tag: tag.name in ("div", "section")
+            and any("footer" in c.lower() for c in tag.get("class", []) + [tag.get("id", "")])
+        ):
+            for a in footer_like.find_all("a", href=True):
+                uname = extract_ig_username(a["href"].strip())
+                if uname:
+                    ig_candidates.append((20, uname, f"https://www.instagram.com/{uname}/"))
+
         # 1. Check all <a> tags with href
         for a in soup.find_all("a", href=True):
             href = a["href"].strip()
@@ -306,7 +353,7 @@ def _scan_soup(soup, html_text=None):
             if uname:
                 is_priority = False
                 parent = a.parent
-                for _ in range(5):
+                for _ in range(8):
                     if parent and getattr(parent, "name", None):
                         tag_str = (str(parent.get("class", [])) + str(parent.get("id", "")) + parent.name).lower()
                         if any(k in tag_str for k in ["footer", "social", "header", "follow", "nav"]):
@@ -395,8 +442,13 @@ def extract_contacts(base_url):
         # subpage, not just the homepage -- a footer Instagram link can be
         # JS-rendered on /contact or /about just as easily as on the
         # homepage). Finding all 3 is a bonus, not required.
+        # Instagram is the top priority -- keep trying the slow render step
+        # for it specifically even if email+phone are already found, rather
+        # than settling early. Still bounded to at most 2 pages total
+        # (homepage + contact), so this doesn't reopen the memory-usage
+        # problem from checking many pages.
         found_types = sum([bool(e1), bool(p1), bool(ig1)])
-        should_render = found_types < 2
+        should_render = (not ig1 and not instagram) or found_types < 2
         if should_render:
             soup_r, html_r = get_soup_rendered(url)
             e2, p2, ig2 = _scan_soup(soup_r, html_r)
@@ -415,8 +467,8 @@ def extract_contacts(base_url):
         if pages_checked >= 2 and not (emails or phones or instagram):
             break
 
-        if sum([bool(emails), bool(phones), bool(instagram)]) >= 2:
-            break  # already found enough -- no need to keep checking pages
+        if instagram and sum([bool(emails), bool(phones), bool(instagram)]) >= 2:
+            break  # Instagram secured, plus at least one more -- good enough
 
         time.sleep(DELAY_BETWEEN_PAGES)
 
