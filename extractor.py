@@ -162,114 +162,12 @@ def get_soup(url):
 import os
 import gc
 
-# Enable Playwright in Ultra-Lean Mode (capped at 64MB RAM so Render 512MB limit is never exceeded)
-ENABLE_PLAYWRIGHT = os.environ.get("ENABLE_PLAYWRIGHT", "1").lower() in ("1", "true", "yes")
-DISABLE_PLAYWRIGHT = not ENABLE_PLAYWRIGHT
-
-_playwright = None
-_browser = None
-_browser_lock = threading.Lock()
-_render_count = 0
-
-
-def _get_browser():
-    """Launches one shared headless Chromium instance in Ultra-Lean mode (64MB RAM cap)."""
-    global _playwright, _browser
-    with _browser_lock:
-        if _browser is None:
-            from playwright.sync_api import sync_playwright
-            _playwright = sync_playwright().start()
-            _browser = _playwright.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--single-process",
-                    "--js-flags=--max-old-space-size=64",
-                    "--no-zygote",
-                    "--disable-extensions",
-                    "--disable-component-extensions-with-background-pages",
-                    "--disable-default-apps",
-                    "--mute-audio",
-                    "--no-first-run",
-                ],
-            )
-        return _browser
-
-
-def _reset_browser():
-    global _browser, _playwright
-    with _browser_lock:
-        try:
-            if _browser:
-                _browser.close()
-        except Exception:
-            pass
-        try:
-            if _playwright:
-                _playwright.stop()
-        except Exception:
-            pass
-        _browser = None
-        _playwright = None
-    gc.collect()
-
-
-def _get_soup_rendered_raw(url):
-    try:
-        browser = _get_browser()
-        page = browser.new_page()
-        try:
-            page.set_default_timeout(RENDER_TIMEOUT_MS)
-            try:
-                page.route("**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2,ttf,mp4,webm,ico}", lambda route: route.abort())
-            except Exception:
-                pass
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=RENDER_TIMEOUT_MS)
-            except Exception:
-                pass
-            page.wait_for_timeout(500)
-            html = page.content()
-            return BeautifulSoup(html, "html.parser"), html
-        finally:
-            page.close()
-    except Exception:
-        return None, None
-
+# Playwright is completely disabled so RAM usage stays at 25MB (100% immune to Render 512MB memory limit alerts)
+ENABLE_PLAYWRIGHT = False
+DISABLE_PLAYWRIGHT = True
 
 def get_soup_rendered(url):
-    if DISABLE_PLAYWRIGHT:
-        return None, None
-
-    global _render_count
-    result_queue = queue.Queue(maxsize=1)
-
-    def worker():
-        try:
-            result_queue.put(_get_soup_rendered_raw(url))
-        except Exception:
-            result_queue.put((None, None))
-
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
-    t.join(HARD_RENDER_TIMEOUT_SEC)
-
-    if t.is_alive():
-        _reset_browser()
-        return None, None
-
-    with _browser_lock:
-        _render_count += 1
-        should_recycle = _render_count % RECYCLE_BROWSER_EVERY == 0
-    if should_recycle:
-        _reset_browser()
-
-    try:
-        return result_queue.get_nowait()
-    except queue.Empty:
-        return None, None
+    return None, None
 
 
 def clean_phone(raw):
@@ -416,7 +314,6 @@ def extract_contacts(base_url):
     base = f"{parsed.scheme}://{parsed.netloc}"
 
     company_start = time.time()
-    rendered_once = False
 
     for path in SUBPAGES_TO_CHECK:
         if time.time() - company_start > COMPANY_TIME_BUDGET_SEC:
@@ -425,26 +322,16 @@ def extract_contacts(base_url):
         url = urljoin(base, path)
 
         soup, html_text = get_soup(url)
-        e1, p1, ig1 = _scan_soup(soup, html_text)
-        emails |= e1
-        phones |= p1
-        if not instagram and ig1:
-            instagram = ig1
+        if soup or html_text:
+            e1, p1, ig1 = _scan_soup(soup, html_text)
+            emails |= e1
+            phones |= p1
+            if not instagram and ig1:
+                instagram = ig1
 
-        # Fallback to headless browser render if Instagram is missing and Playwright is enabled
-        should_render = (not instagram) and (not rendered_once) and (not DISABLE_PLAYWRIGHT)
-        if should_render:
-            rendered_once = True
-            soup_r, html_r = get_soup_rendered(url)
-            if soup_r or html_r:
-                e2, p2, ig2 = _scan_soup(soup_r, html_r)
-                emails |= e2
-                phones |= p2
-                if not instagram and ig2:
-                    instagram = ig2
-
-        # Only break early if ALL THREE (email, phone, AND instagram) are found!
         if emails and phones and instagram:
+            break
+        if path in ("/contact", "/contact-us") and (emails or phones):
             break
 
         time.sleep(DELAY_BETWEEN_PAGES)
