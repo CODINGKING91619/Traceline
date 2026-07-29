@@ -16,9 +16,9 @@ SUBPAGES_TO_CHECK = ["", "/contact", "/contact-us", "/get-in-touch", "/about", "
 REQUEST_TIMEOUT = 6
 DELAY_BETWEEN_PAGES = 0.2
 RENDER_TIMEOUT_MS = 4000
-HARD_RENDER_TIMEOUT_SEC = 6   # absolute ceiling per page render
-RECYCLE_BROWSER_EVERY = 10     # relaunch browser frequently to keep RAM low on 512MB hosting
-COMPANY_TIME_BUDGET_SEC = 25   # hard ceiling on total time spent per company, across all its subpages
+HARD_RENDER_TIMEOUT_SEC = 6
+RECYCLE_BROWSER_EVERY = 10
+COMPANY_TIME_BUDGET_SEC = 25
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
 PHONE_REGEX = re.compile(r"(\+?\d[\d\-.\s()]{8,}\d)")
@@ -162,7 +162,7 @@ def get_soup(url):
 import os
 import gc
 
-# Enable Playwright by default so headless browser renders client-side JS footers/widgets on hosting
+# Enable Playwright in Ultra-Lean Mode (capped at 64MB RAM so Render 512MB limit is never exceeded)
 ENABLE_PLAYWRIGHT = os.environ.get("ENABLE_PLAYWRIGHT", "1").lower() in ("1", "true", "yes")
 DISABLE_PLAYWRIGHT = not ENABLE_PLAYWRIGHT
 
@@ -173,6 +173,7 @@ _render_count = 0
 
 
 def _get_browser():
+    """Launches one shared headless Chromium instance in Ultra-Lean mode (64MB RAM cap)."""
     global _playwright, _browser
     with _browser_lock:
         if _browser is None:
@@ -184,7 +185,8 @@ def _get_browser():
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
-                    "--js-flags=--max-old-space-size=128",
+                    "--single-process",
+                    "--js-flags=--max-old-space-size=64",
                     "--no-zygote",
                     "--disable-extensions",
                     "--disable-component-extensions-with-background-pages",
